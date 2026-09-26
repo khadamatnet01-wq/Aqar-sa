@@ -27,15 +27,23 @@ const proxyConfiguration = await Actor.createProxyConfiguration(
 const finalItems = [];
 const seenIds = new Set();
 
-// بناء رابط البحث من الأجزاء، أو استخدام startUrl مباشرة إن وُجد
+// تطبيع نص: استبدال المسافات بشرطات، وحذف الشرطات الزائدة في البداية/النهاية
+function normalizeSegment(text) {
+    if (!text) return '';
+    return text.trim().replace(/\s+/g, '-').replace(/^-+|-+$/g, '');
+}
+
+// بناء رابط البحث من الأجزاء بعد تطبيعها، أو استخدام startUrl مباشرة إن وُجد
 function buildListUrl() {
     if (startUrl && startUrl.trim()) return startUrl.trim();
 
-    const parts = [search, city];
-    if (subArea && subArea.trim()) parts.push(subArea.trim());
-    if (district && district.trim()) parts.push(district.trim());
+    const parts = [normalizeSegment(search), normalizeSegment(city)];
+    const normSubArea = normalizeSegment(subArea);
+    const normDistrict = normalizeSegment(district);
+    if (normSubArea) parts.push(normSubArea);
+    if (normDistrict) parts.push(normDistrict);
 
-    const path = parts.map(p => encodeURI(p)).join('/');
+    const path = parts.filter(Boolean).map(p => encodeURI(p)).join('/');
     return `https://sa.aqar.fm/${path}`;
 }
 
