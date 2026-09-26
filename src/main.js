@@ -1,7 +1,5 @@
 // -*- coding: utf-8 -*-
 // أكتور Apify لاستخراج إعلانات عقار (sa.aqar.fm)
-// الاستراتيجية: استخراج كل البيانات من صفحة القائمة مباشرة (تحتوي كل الحقول)
-// ثم فتح صفحة الإعلان فقط عند الحاجة لجوال محجوب بجافاسكريبت
 
 import { Actor } from 'apify';
 import { PlaywrightCrawler, log } from 'crawlee';
@@ -10,10 +8,14 @@ await Actor.init();
 
 const input = (await Actor.getInput()) || {};
 const {
-    search = 'شقق-للبيع',   // مثال: شقق-للبيع, فلل-للإيجار, أراضي-للبيع
+    // يمكن كتابة مسار كامل جاهز، أو تركه فارغاً واستخدام الحقول أدناه
+    startUrl = '',
+    search = 'شقق-للبيع',
     city = 'الرياض',
+    subArea = '',      // اختياري: مثال "شمال-الرياض"
+    district = '',      // اختياري: مثال "حي-الياسمين"
     maxResults = 20,
-    fetchPhoneFromDetail = true, // فتح صفحة التفاصيل لمحاولة جلب الجوال المحجوب
+    fetchPhoneFromDetail = true,
     proxyConfiguration: proxyInput,
     webhookUrl = '',
 } = input;
@@ -25,7 +27,18 @@ const proxyConfiguration = await Actor.createProxyConfiguration(
 const finalItems = [];
 const seenIds = new Set();
 
-// استخراج أول جوال سعودي من أي نص
+// بناء رابط البحث من الأجزاء، أو استخدام startUrl مباشرة إن وُجد
+function buildListUrl() {
+    if (startUrl && startUrl.trim()) return startUrl.trim();
+
+    const parts = [search, city];
+    if (subArea && subArea.trim()) parts.push(subArea.trim());
+    if (district && district.trim()) parts.push(district.trim());
+
+    const path = parts.map(p => encodeURI(p)).join('/');
+    return `https://sa.aqar.fm/${path}`;
+}
+
 const extractPhone = (text) => {
     if (!text) return '';
     const match = text.match(/(?:\+?966|0)5[0-9]{8}/);
@@ -47,17 +60,34 @@ const crawler = new PlaywrightCrawler({
     async requestHandler({ page, request, log: reqLog }) {
 
         // ==========================================
-        // مسار 1: صفحة القائمة — استخراج البيانات من كل بطاقة
+        // مسار 1: صفحة القائمة
         // ==========================================
         if (request.userData.label === 'LIST') {
 
             const pageNum = request.userData.pageNum || 1;
-            const listUrl = pageNum === 1
-                ? `https://sa.aqar.fm/${encodeURI(search)}/${encodeURI(city)}`
-                : `https://sa.aqar.fm/${encodeURI(search)}/${encodeURI(city)}/${pageNum}`;
+            const baseUrl = request.userData.baseUrl;
+            const listUrl = pageNum === 1 ? baseUrl : `${baseUrl}/${pageNum}`;
 
             reqLog.info(`فتح صفحة القائمة رقم ${pageNum}: ${listUrl}`);
-            await page.goto(listUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+
+            const response = await page.goto(listUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+
+            // التحقق من حالة الاستجابة (404 يعني رابط خاطئ)
+            const status = response?.status();
+            if (status && status >= 400) {
+                reqLog.error(`⚠️ الرابط أعاد حالة ${status} — تحقق من صحة المسار: ${listUrl}`);
+                return;
+            }
+
+            // التحقق من وجود رسالة "لا توجد نتائج"
+            const noResultsFound = await page.evaluate(() => {
+                const text = document.body.innerText || '';
+                return /لا توجد نتائج|لم يتم العثور|no results/i.test(text);
+            });
+            if (noResultsFound) {
+                reqLog.warning(`⚠️ الصفحة لا تحتوي نتائج — تحقق من صحة المسار أو جرّب مسار آخر: ${listUrl}`);
+                return;
+            }
 
             try {
                 await page.waitForSelector('a[href*="-"]', { timeout: 15000 });
@@ -66,12 +96,10 @@ const crawler = new PlaywrightCrawler({
             }
             await page.waitForTimeout(1500);
 
-            // استخراج بطاقات الإعلانات من الصفحة
             const cards = await page.evaluate(() => {
                 const results = [];
                 const seen = new Set();
 
-                // كل بطاقة تنتهي برقم في نهاية الرابط (معرف الإعلان)
                 const links = Array.from(document.querySelectorAll('a[href]'))
                     .filter(a => a.href.match(/-\d{5,}$/) && a.href.includes('sa.aqar.fm'));
 
@@ -85,36 +113,34 @@ const crawler = new PlaywrightCrawler({
 
                     const fullText = link.innerText || '';
                     const lines = fullText.split('\n').map(l => l.trim()).filter(Boolean);
-
-                    // السطر الأول عادة هو العنوان الكامل
                     const title = lines[0] || '';
 
-                    // السعر: أول رقم يليه § أو "سنوي"
                     const priceMatch = fullText.match(/([\d,]+(?:\.\d+)?)\s*§/);
                     const price = priceMatch ? priceMatch[1].replace(/,/g, '') : '';
                     const isRent = /سنوي/.test(fullText);
 
-                    // المساحة
                     const areaMatch = fullText.match(/([\d,]+)\s*م²/);
                     const area = areaMatch ? areaMatch[1].replace(/,/g, '') : '';
 
-                    // استخراج الحي والمدينة من العنوان (نمط: ... حي X, مدينة Y)
                     const districtMatch = title.match(/حي\s+([^\,،]+)/);
                     const cityMatch = title.match(/مدينة\s+([^\,،]+)/);
-                    const district = districtMatch ? districtMatch[1].trim() : '';
+                    const districtName = districtMatch ? districtMatch[1].trim() : '';
                     const cityName = cityMatch ? cityMatch[1].trim() : '';
 
-                    // نوع العقار من بداية العنوان
                     const propTypeMatch = title.match(/^([\u0600-\u06FF]+)\s+(?:للبيع|للإيجار)/);
                     const propertyType = propTypeMatch ? propTypeMatch[1].trim() : '';
 
-                    // الوصف الكامل (باقي الأسطر بعد استبعاد الأرقام والعنوان)
                     const description = lines.slice(1).join(' ').trim();
 
-                    // الجوال إن وُجد صراحة في النص (بعض الإعلانات القديمة)
-                    const phone = extractPhoneInline(fullText);
+                    const phoneMatch = fullText.match(/(?:\+?966|0)5[0-9]{8}/);
+                    let phone = '';
+                    if (phoneMatch) {
+                        phone = phoneMatch[0].replace(/\s|-/g, '');
+                        if (phone.startsWith('+9665')) phone = '0' + phone.slice(4);
+                        if (phone.startsWith('9665'))  phone = '0' + phone.slice(3);
+                        if (phone.startsWith('5'))     phone = '0' + phone;
+                    }
 
-                    // الصورة
                     const imgEl = link.querySelector('img');
                     const imgSrc = imgEl?.src || imgEl?.getAttribute('data-src') || '';
 
@@ -124,7 +150,7 @@ const crawler = new PlaywrightCrawler({
                         priceSar: price,
                         listing_type: isRent ? 'rent' : 'sale',
                         area_sqm: area,
-                        district,
+                        district: districtName,
                         city: cityName,
                         property_type: propertyType,
                         description,
@@ -133,16 +159,6 @@ const crawler = new PlaywrightCrawler({
                         images: imgSrc ? [imgSrc] : [],
                         url: href,
                     });
-
-                    function extractPhoneInline(text) {
-                        const m = text.match(/(?:\+?966|0)5[0-9]{8}/);
-                        if (!m) return '';
-                        let p = m[0].replace(/\s|-/g, '');
-                        if (p.startsWith('+9665')) p = '0' + p.slice(4);
-                        if (p.startsWith('9665'))  p = '0' + p.slice(3);
-                        if (p.startsWith('5'))     p = '0' + p;
-                        return p;
-                    }
                 }
                 return results;
             });
@@ -163,7 +179,6 @@ const crawler = new PlaywrightCrawler({
                 card.posted_at_iso = '';
                 card.scanned_at = new Date().toISOString();
 
-                // استخراج رخصة فال إن وجدت في الوصف
                 const licenseMatch = card.description.match(/(?:رخصة فال|رخصه فال|ترخيص)\s*:?\s*(\d{6,})/);
                 if (licenseMatch) card.rega_license = licenseMatch[1];
 
@@ -171,18 +186,20 @@ const crawler = new PlaywrightCrawler({
                 newCount++;
             }
 
-            reqLog.info(`تم جمع ${finalItems.length} إعلان حتى الآن (صفحة ${pageNum})...`);
+            reqLog.info(`تم جمع ${finalItems.length} إعلان حتى الآن (صفحة ${pageNum}) — ${cards.length} بطاقة وُجدت في هذه الصفحة`);
 
-            // الانتقال للصفحة التالية إذا لم نصل للحد المطلوب
+            if (cards.length === 0) {
+                reqLog.warning(`⚠️ لم يُعثر على أي بطاقة إعلان في الصفحة. تحقق من صحة الرابط: ${listUrl}`);
+            }
+
             if (finalItems.length < maxResults && newCount > 0 && pageNum < 50) {
                 await crawler.addRequests([{
-                    url: `${listUrl}#page${pageNum + 1}`,
+                    url: `${baseUrl}#page${pageNum + 1}`,
                     uniqueKey: `list-page-${pageNum + 1}`,
-                    userData: { label: 'LIST', pageNum: pageNum + 1 },
+                    userData: { label: 'LIST', pageNum: pageNum + 1, baseUrl },
                 }]);
             }
 
-            // فتح صفحة كل إعلان لا يحتوي على جوال، لمحاولة كشفه
             if (fetchPhoneFromDetail) {
                 for (const item of cards) {
                     if (!item.phone) {
@@ -195,7 +212,7 @@ const crawler = new PlaywrightCrawler({
             }
 
         // ==========================================
-        // مسار 2: صفحة تفاصيل الإعلان — محاولة كشف الجوال المحجوب + تاريخ النشر
+        // مسار 2: صفحة تفاصيل الإعلان
         // ==========================================
         } else if (request.userData.label === 'DETAIL') {
 
@@ -214,7 +231,6 @@ const crawler = new PlaywrightCrawler({
             await page.goto(request.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
             await page.waitForTimeout(1500);
 
-            // محاولة الضغط على زر "اتصال" لكشف الرقم
             try {
                 const callBtn = await page.$('button:has-text("اتصال"), a:has-text("اتصال"), [class*="call"], [class*="phone"]');
                 if (callBtn) {
@@ -223,11 +239,9 @@ const crawler = new PlaywrightCrawler({
                 }
             } catch { /* تجاهل */ }
 
-            // قراءة كل نص الصفحة بعد محاولة الكشف
             const pageText = await page.evaluate(() => document.body.innerText || '');
             let phone = extractPhone(pageText);
 
-            // Fallback: من رابط tel:
             if (!phone) {
                 const telHref = await page.evaluate(() => {
                     const el = document.querySelector('a[href^="tel:"]');
@@ -236,7 +250,6 @@ const crawler = new PlaywrightCrawler({
                 if (telHref) phone = telHref.replace('tel:', '').trim();
             }
 
-            // البحث عن __NEXT_DATA__ لتاريخ النشر ومعلومات إضافية
             const nextDataText = await page.evaluate(() => {
                 const el = document.querySelector('#__NEXT_DATA__');
                 return el ? el.textContent : null;
@@ -292,7 +305,6 @@ const crawler = new PlaywrightCrawler({
                 }
             }
 
-            // Fallback لتاريخ النشر من DOM
             if (!posted_at) {
                 const domDate = await page.evaluate(() => {
                     const el = document.querySelector('time[datetime], [class*="date"], [class*="publish"]');
@@ -334,17 +346,23 @@ const crawler = new PlaywrightCrawler({
     },
 });
 
+const initialUrl = buildListUrl();
+log.info(`🔗 رابط البحث المُركّب: ${initialUrl}`);
+
 await crawler.run([{
-    url: `https://sa.aqar.fm/${encodeURI(search)}/${encodeURI(city)}`,
-    userData: { label: 'LIST', pageNum: 1 },
+    url: initialUrl,
+    userData: { label: 'LIST', pageNum: 1, baseUrl: initialUrl },
 }]);
 
-// دفع كل العناصر النهائية للـ dataset (بعد اكتمال كل المحاولات)
 for (const item of finalItems) {
     await Actor.pushData(item);
 }
 
 log.info(`🎉 اكتمل! تم استخراج ${finalItems.length} إعلان.`);
+
+if (finalItems.length === 0) {
+    log.warning('⚠️ لم يتم استخراج أي إعلان. تأكد من صحة تركيب الرابط: نوع-البحث/المدينة/المنطقة-الفرعية/الحي مثل: فلل-للبيع/الرياض/شمال-الرياض/حي-الياسمين — أو استخدم حقل startUrl لصق رابط جاهز من الموقع.');
+}
 
 if (webhookUrl && webhookUrl.trim()) {
     try {
@@ -367,4 +385,3 @@ if (webhookUrl && webhookUrl.trim()) {
 }
 
 await Actor.exit();
-      
