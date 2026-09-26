@@ -1,0 +1,51 @@
+{
+    "title": "إعدادات سحب عقار",
+    "description": "ضبط معاملات البحث في موقع عقار (aqar.fm)",
+    "type": "object",
+    "schemaVersion": 1,
+    "properties": {
+        "search": {
+            "title": "نوع البحث",
+            "type": "string",
+            "description": "مثال: شقق-للبيع، فلل-للإيجار، أراضي-للبيع، دور-للبيع، عمائر-للبيع",
+            "default": "شقق-للبيع",
+            "editor": "textfield"
+        },
+        "city": {
+            "title": "المدينة",
+            "type": "string",
+            "description": "اسم المدينة بالعربي كما يظهر في رابط الموقع، مثل: الرياض، جدة، الدمام",
+            "default": "الرياض",
+            "editor": "textfield"
+        },
+        "maxResults": {
+            "title": "أقصى عدد للنتائج",
+            "type": "integer",
+            "description": "عدد الإعلانات المطلوب استخراجها",
+            "default": 20,
+            "minimum": 1,
+            "maximum": 500,
+            "editor": "number"
+        },
+        "fetchPhoneFromDetail": {
+            "title": "محاولة كشف الجوال المحجوب",
+            "type": "boolean",
+            "description": "فتح صفحة كل إعلان لا يظهر جواله في القائمة، ومحاولة الضغط على زر الاتصال لكشفه (أبطأ لكن أدق)",
+            "default": true,
+            "editor": "checkbox"
+        },
+        "proxyConfiguration": {
+            "title": "إعدادات البروكسي",
+            "type": "object",
+            "description": "يُنصح باستخدام Apify Residential Proxy لتجنب الحجب",
+            "prefill": { "useApifyProxy": true, "groups": ["RESIDENTIAL"] },
+            "editor": "proxy"
+        },
+        "webhookUrl": {
+            "title": "رابط Webhook (اختياري)",
+            "type": "string",
+            "description": "رابط يُرسَل إليه إشعار JSON عند اكتمال السحب",
+            "editor": "textfield"
+        }
+    }
+}
