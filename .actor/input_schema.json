@@ -4,6 +4,12 @@
     "type": "object",
     "schemaVersion": 1,
     "properties": {
+        "startUrl": {
+            "title": "رابط جاهز (اختياري - يتجاوز الحقول أدناه)",
+            "type": "string",
+            "description": "الصق رابط صفحة بحث كامل من الموقع مباشرة، مثل: https://sa.aqar.fm/فلل-للبيع/الرياض/شمال-الرياض/حي-الياسمين — إذا تُرك فارغاً سيُبنى الرابط من الحقول أدناه",
+            "editor": "textfield"
+        },
         "search": {
             "title": "نوع البحث",
             "type": "string",
@@ -14,8 +20,20 @@
         "city": {
             "title": "المدينة",
             "type": "string",
-            "description": "اسم المدينة بالعربي كما يظهر في رابط الموقع، مثل: الرياض، جدة، الدمام",
+            "description": "اسم المدينة فقط (وليس الحي)، مثل: الرياض، جدة، الدمام",
             "default": "الرياض",
+            "editor": "textfield"
+        },
+        "subArea": {
+            "title": "المنطقة الفرعية (اختياري)",
+            "type": "string",
+            "description": "مثال: شمال-الرياض، شرق-الرياض، غرب-الرياض، جنوب-الرياض",
+            "editor": "textfield"
+        },
+        "district": {
+            "title": "الحي (اختياري)",
+            "type": "string",
+            "description": "يجب أن يبدأ بكلمة حي-، مثال: حي-الياسمين — ملاحظة: تحديد الحي يتطلب أيضاً تحديد المنطقة الفرعية أعلاه",
             "editor": "textfield"
         },
         "maxResults": {
