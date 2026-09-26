@@ -1,0 +1,59 @@
+{
+    "actorSpecification": 1,
+    "fields": {
+        "name": { "title": "عنوان الإعلان", "type": "string" },
+        "priceSar": { "title": "السعر (ريال)", "type": "string" },
+        "listing_type": { "title": "بيع / إيجار", "type": "string" },
+        "property_type": { "title": "نوع العقار", "type": "string" },
+        "city": { "title": "المدينة", "type": "string" },
+        "district": { "title": "الحي", "type": "string" },
+        "area_sqm": { "title": "المساحة (م²)", "type": "string" },
+        "bedrooms": { "title": "غرف النوم", "type": "string" },
+        "bathrooms": { "title": "دورات المياه", "type": "string" },
+        "phone": { "title": "رقم الجوال", "type": "string" },
+        "owner_name": { "title": "اسم المعلن", "type": "string" },
+        "rega_license": { "title": "رخصة فال / رقم الترخيص", "type": "string" },
+        "is_verified": { "title": "موثّق", "type": "boolean" },
+        "posted_at": { "title": "تاريخ النشر", "type": "string" },
+        "posted_at_iso": { "title": "تاريخ النشر (ISO)", "type": "string" },
+        "scanned_at": { "title": "وقت الفحص", "type": "string" },
+        "description": { "title": "وصف الإعلان", "type": "string" },
+        "has_image": { "title": "يحتوي صور", "type": "boolean" },
+        "images": { "title": "روابط الصور", "type": "array" },
+        "url": { "title": "رابط الإعلان", "type": "string" }
+    },
+    "views": {
+        "overview": {
+            "title": "نظرة عامة",
+            "transformation": {
+                "fields": [
+                    "name",
+                    "priceSar",
+                    "listing_type",
+                    "property_type",
+                    "city",
+                    "district",
+                    "area_sqm",
+                    "phone",
+                    "posted_at",
+                    "url"
+                ]
+            },
+            "display": {
+                "component": "table",
+                "properties": {
+                    "name": { "label": "عنوان الإعلان", "format": "text" },
+                    "priceSar": { "label": "السعر", "format": "text" },
+                    "listing_type": { "label": "بيع/إيجار", "format": "text" },
+                    "property_type": { "label": "نوع العقار", "format": "text" },
+                    "city": { "label": "المدينة", "format": "text" },
+                    "district": { "label": "الحي", "format": "text" },
+                    "area_sqm": { "label": "المساحة", "format": "text" },
+                    "phone": { "label": "الجوال", "format": "text" },
+                    "posted_at": { "label": "تاريخ النشر", "format": "text" },
+                    "url": { "label": "الرابط", "format": "link" }
+                }
+            }
+        }
+    }
+}
