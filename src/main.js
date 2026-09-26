@@ -27,11 +27,70 @@ const proxyConfiguration = await Actor.createProxyConfiguration(
 const finalItems = [];
 const seenIds = new Set();
 
+// قائمة أنواع البحث الصحيحة المعروفة في عقار
+const VALID_SEARCH_TYPES = [
+    'شقق-للبيع', 'شقق-للإيجار', 'فلل-للبيع', 'فلل-للإيجار',
+    'أراضي-للبيع', 'أراضي-للإيجار', 'دور-للبيع', 'دور-للإيجار',
+    'عمائر-للبيع', 'عمائر-للإيجار', 'محلات-للبيع', 'محلات-للإيجار',
+    'مكتب-تجاري-للبيع', 'مكتب-تجاري-للإيجار', 'استراحة-للبيع', 'استراحة-للإيجار',
+    'استوديوهات-للبيع', 'استوديوهات-للإيجار', 'مزرعة-للبيع', 'مزرعة-للإيجار',
+    'عقارات',
+];
+
+// التحقق من صحة كل مدخل قبل بناء أي رابط أو فتح المتصفح
+function validateInputs() {
+    const errors = [];
+
+    if (startUrl && startUrl.trim()) {
+        if (!startUrl.includes('aqar.fm')) {
+            errors.push(`startUrl لا يبدو رابط عقار صحيح: ${startUrl}`);
+        }
+        return errors; // لا حاجة لفحص باقي الحقول إذا استُخدم رابط جاهز
+    }
+
+    if (!search || !search.trim()) {
+        errors.push('حقل "نوع البحث" فارغ.');
+    } else if (!VALID_SEARCH_TYPES.includes(search.trim()) && !/^(.+)-(للبيع|للإيجار)$/.test(search.trim())) {
+        errors.push(`"${search}" ليس نوع بحث صحيح. يجب أن ينتهي بـ "-للبيع" أو "-للإيجار" (مثل: فلل-للبيع)، وليس فقط "فلل".`);
+    }
+
+    if (!city || !city.trim()) {
+        errors.push('حقل "المدينة" فارغ.');
+    } else {
+        if (/^حي[- ]/.test(city.trim())) {
+            errors.push(`"${city}" يبدو أنه اسم حي وليس مدينة. ضع اسم الحي في حقل "الحي" بدلاً من ذلك، مع تحديد المدينة الصحيحة هنا (مثل: الرياض).`);
+        }
+        if (city.includes(' ')) {
+            errors.push(`حقل "المدينة" (${city}) يحتوي مسافة — استخدم شرطة "-" بدل المسافة، أو تأكد أنه اسم مدينة صحيح فقط.`);
+        }
+    }
+
+    if (subArea && subArea.trim()) {
+        if (subArea.includes(' ')) {
+            errors.push(`حقل "المنطقة الفرعية" (${subArea}) يحتوي مسافة — استخدم شرطة "-" مثل: شمال-الرياض.`);
+        }
+        if (VALID_SEARCH_TYPES.includes(subArea.trim()) || /(للبيع|للإيجار)/.test(subArea)) {
+            errors.push(`"${subArea}" في حقل "المنطقة الفرعية" يبدو نوع بحث وليس منطقة جغرافية — تحقق من ترتيب الحقول.`);
+        }
+    }
+
+    if (district && district.trim()) {
+        if (!/^حي[-]/.test(district.trim())) {
+            errors.push(`حقل "الحي" (${district}) يجب أن يبدأ بـ "حي-" مثل: حي-الياسمين.`);
+        }
+        if (!subArea || !subArea.trim()) {
+            errors.push('تحديد "الحي" يتطلب أيضاً تعبئة "المنطقة الفرعية" (مثل: شمال-الرياض).');
+        }
+    }
+
+    return errors;
+}
+
 // بناء رابط البحث من الأجزاء، أو استخدام startUrl مباشرة إن وُجد
 function buildListUrl() {
     if (startUrl && startUrl.trim()) return startUrl.trim();
 
-    const parts = [search, city];
+    const parts = [search.trim(), city.trim()];
     if (subArea && subArea.trim()) parts.push(subArea.trim());
     if (district && district.trim()) parts.push(district.trim());
 
@@ -72,14 +131,12 @@ const crawler = new PlaywrightCrawler({
 
             const response = await page.goto(listUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-            // التحقق من حالة الاستجابة (404 يعني رابط خاطئ)
             const status = response?.status();
             if (status && status >= 400) {
                 reqLog.error(`⚠️ الرابط أعاد حالة ${status} — تحقق من صحة المسار: ${listUrl}`);
                 return;
             }
 
-            // التحقق من وجود رسالة "لا توجد نتائج"
             const noResultsFound = await page.evaluate(() => {
                 const text = document.body.innerText || '';
                 return /لا توجد نتائج|لم يتم العثور|no results/i.test(text);
@@ -345,6 +402,19 @@ const crawler = new PlaywrightCrawler({
         log.error(`❌ فشل: ${request.url} — ${error.message}`);
     },
 });
+
+// ── التحقق من صحة المدخلات قبل فتح أي متصفح أو دفع أي تكلفة ─────────────
+const validationErrors = validateInputs();
+if (validationErrors.length > 0) {
+    log.error('❌ توقف التشغيل قبل البدء بسبب أخطاء في المدخلات:');
+    for (const err of validationErrors) {
+        log.error(`   • ${err}`);
+    }
+    log.error('مثال صحيح كامل: search=فلل-للبيع، city=الرياض، subArea=شمال-الرياض، district=حي-الياسمين');
+    log.error('أو الأسهل: الصق رابط بحث جاهز من متصفحك في حقل startUrl.');
+    await Actor.exit();
+    process.exit(0);
+}
 
 const initialUrl = buildListUrl();
 log.info(`🔗 رابط البحث المُركّب: ${initialUrl}`);
