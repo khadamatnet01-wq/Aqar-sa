@@ -25,6 +25,7 @@ const {
 // 🔍 تشخيص: يطبع القيمة الفعلية المُستلمة من Apify لهذا الحقل تحديداً،
 // لكشف ما إذا كان الخيار وصل فعلاً كـ true أو أنه لم يُستلم أصلاً (undefined/false)
 log.info(`🔍 تشخيص المدخلات: todayOnly المُستلم = ${JSON.stringify(input.todayOnly)} (النوع: ${typeof input.todayOnly}) — القيمة الفعلية المستخدمة = ${todayOnly}`);
+log.info(`🔍 تشخيص روابط: startUrl="${input.startUrl || '(فارغ)'}" | search="${input.search || '(فارغ)'}" | city="${input.city || '(فارغ)'}" | subArea="${input.subArea || '(فارغ)'}" | district="${input.district || '(فارغ)'}"`);
 
 const proxyConfiguration = await Actor.createProxyConfiguration(
     proxyInput || { useApifyProxy: true, groups: ['RESIDENTIAL'] },
