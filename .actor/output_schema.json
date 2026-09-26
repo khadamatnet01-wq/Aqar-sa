@@ -1,0 +1,13 @@
+{
+    "actorSpecification": 1,
+    "fields": {
+        "totalItems": {
+            "title": "إجمالي الإعلانات المستخرجة",
+            "type": "integer"
+        },
+        "searchQuery": {
+            "title": "نوع البحث المستخدم",
+            "type": "string"
+        }
+    }
+}
