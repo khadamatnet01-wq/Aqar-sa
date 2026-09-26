@@ -22,6 +22,10 @@ const {
     webhookUrl = '',
 } = input;
 
+// 🔍 تشخيص: يطبع القيمة الفعلية المُستلمة من Apify لهذا الحقل تحديداً،
+// لكشف ما إذا كان الخيار وصل فعلاً كـ true أو أنه لم يُستلم أصلاً (undefined/false)
+log.info(`🔍 تشخيص المدخلات: todayOnly المُستلم = ${JSON.stringify(input.todayOnly)} (النوع: ${typeof input.todayOnly}) — القيمة الفعلية المستخدمة = ${todayOnly}`);
+
 const proxyConfiguration = await Actor.createProxyConfiguration(
     proxyInput || { useApifyProxy: true, groups: ['RESIDENTIAL'] },
 );
@@ -354,7 +358,6 @@ const crawler = new PlaywrightCrawler({
 
                     const detail = await fetchDetail(page, card.url, reqLog);
 
-                    // إن لم يوجد تاريخ نشر إطلاقاً، لا يمكن الحكم — نتجاهل الإعلان بدل تخمين قبوله
                     if (!detail.posted_at_iso) {
                         reqLog.warning(`⚠️ لا يوجد تاريخ نشر واضح، تم تجاوز الإعلان: ${card.url}`);
                         continue;
@@ -500,27 +503,4 @@ for (const item of finalItems) {
 log.info(`🎉 اكتمل! تم استخراج ${finalItems.length} إعلان${todayOnly ? ' من اليوم' : ''}.`);
 
 if (finalItems.length === 0) {
-    log.warning('⚠️ لم يتم استخراج أي إعلان. تأكد من صحة الرابط، أو أن وضع "اليوم فقط" لم يكن صارماً جداً لهذا البحث.');
-}
-
-if (webhookUrl && webhookUrl.trim()) {
-    try {
-        const datasetId = process.env.APIFY_DEFAULT_DATASET_ID;
-        await fetch(webhookUrl, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                status: 'success',
-                search,
-                city,
-                itemsCount: finalItems.length,
-                downloadUrl: `https://api.apify.com/v2/datasets/${datasetId}/items?format=json`,
-            }),
-        });
-        log.info('✅ Webhook أُرسل بنجاح.');
-    } catch (err) {
-        log.error(`❌ فشل Webhook: ${err.message}`);
-    }
-}
-
-await Actor.exit();
+    log.warning('⚠️ لم يتم استخ
