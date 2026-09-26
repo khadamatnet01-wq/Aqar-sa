@@ -358,6 +358,7 @@ const crawler = new PlaywrightCrawler({
 
                     const detail = await fetchDetail(page, card.url, reqLog);
 
+                    // إن لم يوجد تاريخ نشر إطلاقاً، لا يمكن الحكم — نتجاهل الإعلان بدل تخمين قبوله
                     if (!detail.posted_at_iso) {
                         reqLog.warning(`⚠️ لا يوجد تاريخ نشر واضح، تم تجاوز الإعلان: ${card.url}`);
                         continue;
@@ -370,10 +371,12 @@ const crawler = new PlaywrightCrawler({
                     }
 
                     if (!isFromToday(detail.posted_at_iso)) {
+                        // تاريخ في المستقبل أو غير متوقع — نتجاوزه بحذر دون إيقاف الزحف
                         reqLog.warning(`⚠️ تاريخ غير متوقع (${detail.posted_at})، تم تجاوز الإعلان.`);
                         continue;
                     }
 
+                    // الإعلان من اليوم فعلاً ← نحتفظ به
                     seenIds.add(card._raw_id);
                     card.source = 'aqar';
                     card.phone = detail.phone || card.phone;
@@ -394,9 +397,10 @@ const crawler = new PlaywrightCrawler({
                 }
 
                 if (sawOlderThanToday || stopCrawling) {
-                    return;
+                    return; // لا ننتقل للصفحة التالية إطلاقاً
                 }
 
+                // كل بطاقات هذه الصفحة كانت من اليوم → قد توجد المزيد في الصفحة التالية
                 if (finalItems.length < maxResults && pageNum < 50) {
                     await crawler.addRequests([{
                         url: `${baseUrl}#page${pageNum + 1}`,
@@ -503,4 +507,27 @@ for (const item of finalItems) {
 log.info(`🎉 اكتمل! تم استخراج ${finalItems.length} إعلان${todayOnly ? ' من اليوم' : ''}.`);
 
 if (finalItems.length === 0) {
-    log.warning('⚠️ لم يتم استخ
+    log.warning('⚠️ لم يتم استخراج أي إعلان. تأكد من صحة الرابط، أو أن وضع "اليوم فقط" لم يكن صارماً جداً لهذا البحث.');
+}
+
+if (webhookUrl && webhookUrl.trim()) {
+    try {
+        const datasetId = process.env.APIFY_DEFAULT_DATASET_ID;
+        await fetch(webhookUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                status: 'success',
+                search,
+                city,
+                itemsCount: finalItems.length,
+                downloadUrl: `https://api.apify.com/v2/datasets/${datasetId}/items?format=json`,
+            }),
+        });
+        log.info('✅ Webhook أُرسل بنجاح.');
+    } catch (err) {
+        log.error(`❌ فشل Webhook: ${err.message}`);
+    }
+}
+
+await Actor.exit();
