@@ -1,0 +1,13 @@
+{
+    "actorSpecification": 1,
+    "name": "aqar-fm-scraper",
+    "title": "عقار - سحب الإعلانات العقارية",
+    "description": "أكتور لاستخراج إعلانات العقارات من موقع عقار السعودي (sa.aqar.fm) بكامل تفاصيلها",
+    "version": "1.0",
+    "buildTag": "latest",
+    "defaultRunOptions": {
+        "build": "latest",
+        "timeoutSecs": 3600,
+        "memoryMbytes": 2048
+    }
+}
