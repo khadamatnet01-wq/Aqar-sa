@@ -17,7 +17,8 @@ const {
     district = '',
     maxResults = 20,
     fetchPhoneFromDetail = true,
-    todayOnly = false,          // ⭐ الميزة الجديدة: جلب إعلانات اليوم فقط
+    todayOnly = false,          // ⭐ جلب إعلانات اليوم فقط
+    maxPagesToScan = 30,        // حد أقصى لعدد الصفحات في وضع "اليوم فقط" (فحص شامل بلا توقف مبكر)
     proxyConfiguration: proxyInput,
     webhookUrl = '',
 } = input;
@@ -121,6 +122,10 @@ async function extractListCards(page) {
             const fullText = link.innerText || '';
             const lines = fullText.split('\n').map(l => l.trim()).filter(Boolean);
             const title = lines[0] || '';
+
+            // ⭐ تجاهل الإعلانات "المميزة" تماماً — ترتيبها مدفوع وليس زمنياً، فتضليل فلترة التاريخ
+            const isFeatured = /^مميز/.test(fullText.trim());
+            if (isFeatured) continue;
 
             const priceMatch = fullText.match(/([\d,]+(?:\.\d+)?)\s*§/);
             const price = priceMatch ? priceMatch[1].replace(/,/g, '') : '';
@@ -385,18 +390,18 @@ async function fetchDetail(page, url, reqLog) {
     return { phone, posted_at, posted_at_iso, bedrooms, bathrooms, owner_name, is_verified, rega_license };
 }
 
-let stopCrawling = false; // علم يوقف الزحف بالكامل عند بلوغ إعلان أقدم من اليوم
+let pagesScannedToday = 0; // عداد الصفحات التي فُحصت فعلياً في وضع اليوم
 
 const crawler = new PlaywrightCrawler({
     proxyConfiguration,
-    maxConcurrency: 1, // ⭐ تسلسلي إجبارياً في وضع اليوم لضمان التوقف الدقيق عند أول إعلان قديم
-    maxRequestsPerCrawl: todayOnly ? 300 : maxResults + 60,
+    maxConcurrency: 1, // تسلسلي لتفادي إثقال الموقع أثناء فتح عشرات صفحات التفاصيل
+    // في وضع "اليوم فقط" لا يوجد توقف مبكر موثوق (الترتيب غير زمني بالكامل بسبب الإعلانات المميزة)،
+    // لذا نفحص عدداً أكبر من الصفحات بحثاً شاملاً بدل الاكتفاء بأول صفحة
+    maxRequestsPerCrawl: todayOnly ? (maxPagesToScan * 30 + 50) : maxResults + 60,
     requestHandlerTimeoutSecs: 240,
     navigationTimeoutSecs: 60,
 
     async requestHandler({ page, request, log: reqLog }) {
-
-        if (stopCrawling) return;
 
         // ==========================================
         // مسار 1: صفحة القائمة
@@ -422,7 +427,7 @@ const crawler = new PlaywrightCrawler({
                 return /لا توجد نتائج|لم يتم العثور|no results/i.test(text);
             });
             if (noResultsFound) {
-                reqLog.warning(`⚠️ لا نتائج في: ${listUrl}`);
+                reqLog.info(`ℹ️ لا مزيد من النتائج بعد صفحة ${pageNum - 1} — انتهت النتائج.`);
                 return;
             }
 
@@ -436,49 +441,35 @@ const crawler = new PlaywrightCrawler({
             const cards = await extractListCards(page);
 
             if (cards.length === 0) {
-                reqLog.warning(`⚠️ لا بطاقات في هذه الصفحة: ${listUrl}`);
+                reqLog.info(`ℹ️ لا بطاقات (غير مميزة) في صفحة ${pageNum} — على الأرجح آخر صفحة.`);
                 return;
             }
 
-            reqLog.info(`وُجدت ${cards.length} بطاقة في صفحة ${pageNum}`);
+            reqLog.info(`وُجدت ${cards.length} بطاقة غير مميزة في صفحة ${pageNum}`);
 
             // ==========================================
-            // وضع "اليوم فقط": نفتح كل إعلان بالتسلسل داخل نفس معالج الصفحة
-            // ونتوقف فوراً عند أول إعلان أقدم من اليوم
+            // وضع "اليوم فقط": فحص شامل لكل الصفحات، بدون توقف مبكر،
+            // لأن ترتيب النتائج ليس زمنياً صارماً (إعلانات مميزة تتصدر بلا علاقة بالتاريخ)
             // ==========================================
-                        
             if (todayOnly) {
-                let sawOlderThanToday = false;
+                pagesScannedToday++;
 
                 for (const card of cards) {
-                    if (finalItems.length >= maxResults) {
-                        stopCrawling = true;
-                        break;
-                    }
                     if (seenIds.has(card._raw_id)) continue;
+                    seenIds.add(card._raw_id);
 
                     const detail = await fetchDetail(page, card.url, reqLog);
 
-                    // إن لم يوجد تاريخ نشر إطلاقاً، لا يمكن الحكم — نتجاهل الإعلان بدل تخمين قبوله
                     if (!detail.posted_at_iso) {
                         reqLog.warning(`⚠️ لا يوجد تاريخ نشر واضح، تم تجاوز الإعلان: ${card.url}`);
                         continue;
                     }
 
-                    if (isOlderThanToday(detail.posted_at_iso)) {
-                        reqLog.info(`⏹️ وُصل لإعلان أقدم من اليوم (${detail.posted_at}) — إيقاف الزحف.`);
-                        sawOlderThanToday = true;
-                        break;
-                    }
-
                     if (!isFromToday(detail.posted_at_iso)) {
-                        // تاريخ في المستقبل أو غير متوقع — نتجاوزه بحذر دون إيقاف الزحف
-                        reqLog.warning(`⚠️ تاريخ غير متوقع (${detail.posted_at})، تم تجاوز الإعلان.`);
+                        // ليس من اليوم — نتجاوزه ونكمل فحص بقية البطاقات؛ لا إيقاف مبكر لعدم موثوقية الترتيب
                         continue;
                     }
 
-                    // الإعلان من اليوم فعلاً ← نحتفظ به
-                    seenIds.add(card._raw_id);
                     card.source = 'aqar';
                     card.phone = detail.phone || card.phone;
                     card.posted_at = detail.posted_at;
@@ -495,19 +486,24 @@ const crawler = new PlaywrightCrawler({
 
                     finalItems.push(card);
                     reqLog.info(`✅ [اليوم] ${card.name.slice(0, 40)} | ${card.priceSar} ريال | ${card.phone || 'لا جوال'} | ${card.posted_at}`);
+
+                    if (finalItems.length >= maxResults) {
+                        reqLog.info(`🎯 تم الوصول للحد الأقصى (${maxResults}) — إيقاف الزحف.`);
+                        return;
+                    }
                 }
 
-                if (sawOlderThanToday || stopCrawling) {
-                    return; // لا ننتقل للصفحة التالية إطلاقاً
-                }
+                reqLog.info(`📊 إجمالي إعلانات اليوم حتى الآن: ${finalItems.length} (بعد فحص ${pagesScannedToday} صفحة)`);
 
-                // كل بطاقات هذه الصفحة كانت من اليوم → قد توجد المزيد في الصفحة التالية
-                if (finalItems.length < maxResults && pageNum < 50) {
+                // ننتقل للصفحة التالية طالما لم نصل للحد الأقصى للنتائج أو لحد الصفحات الآمن
+                if (pagesScannedToday < maxPagesToScan) {
                     await crawler.addRequests([{
                         url: `${baseUrl}#page${pageNum + 1}`,
                         uniqueKey: `list-page-${pageNum + 1}`,
                         userData: { label: 'LIST', pageNum: pageNum + 1, baseUrl },
                     }]);
+                } else {
+                    reqLog.warning(`⚠️ تم بلوغ الحد الأقصى للصفحات (${maxPagesToScan}) — قد توجد إعلانات إضافية من اليوم في صفحات لاحقة لم تُفحص. زد "maxPagesToScan" إذا لزم.`);
                 }
 
             // ==========================================
@@ -605,10 +601,14 @@ for (const item of finalItems) {
     await Actor.pushData(item);
 }
 
-log.info(`🎉 اكتمل! تم استخراج ${finalItems.length} إعلان${todayOnly ? ' من اليوم' : ''}.`);
+log.info(`🎉 اكتمل! تم استخراج ${finalItems.length} إعلان${todayOnly ? ` من اليوم (بعد فحص ${pagesScannedToday} صفحة، مع تجاهل الإعلانات المميزة)` : ''}.`);
 
 if (finalItems.length === 0) {
-    log.warning('⚠️ لم يتم استخراج أي إعلان. تأكد من صحة الرابط، أو أن وضع "اليوم فقط" لم يكن صارماً جداً لهذا البحث.');
+    if (todayOnly) {
+        log.warning(`⚠️ لم يُعثر على أي إعلان من اليوم بعد فحص ${pagesScannedToday} صفحة. قد لا توجد إعلانات جديدة اليوم لهذا البحث تحديداً، أو تحتاج زيادة "maxPagesToScan".`);
+    } else {
+        log.warning('⚠️ لم يتم استخراج أي إعلان. تأكد من صحة الرابط.');
+    }
 }
 
 if (webhookUrl && webhookUrl.trim()) {
@@ -632,4 +632,3 @@ if (webhookUrl && webhookUrl.trim()) {
 }
 
 await Actor.exit();
-                      
