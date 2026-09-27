@@ -1,5 +1,4 @@
-
-                        // -*- coding: utf-8 -*-
+// -*- coding: utf-8 -*-
 // أكتور Apify لاستخراج إعلانات عقار (sa.aqar.fm)
 // وضع "اليوم فقط": يتوقف تلقائياً بمجرد الوصول لأول إعلان أقدم من اليوم،
 // لأن الموقع يرتب النتائج بالأحدث أولاً — فلا داعي لمتابعة الزحف بعد ذلك.
@@ -173,6 +172,84 @@ async function extractListCards(page) {
 }
 
 // فتح صفحة تفاصيل إعلان واحد وجلب الجوال + تاريخ النشر
+// تحويل نص عربي نسبي مثل "منذ 9 ساعات تقريباً" أو "منذ 3 أيام" إلى تاريخ فعلي
+function parseArabicRelativeDate(text) {
+    if (!text) return null;
+    const now = new Date();
+    const cleaned = text.replace(/تقريباً|تقريبا|تقريب/g, '').trim();
+
+    if (/اليوم|الآن|منذ لحظات|منذ قليل/.test(cleaned)) {
+        return now;
+    }
+    if (/أمس/.test(cleaned)) {
+        const d = new Date(now);
+        d.setDate(d.getDate() - 1);
+        return d;
+    }
+
+    // JS regex \b لا يعمل بشكل صحيح مع الحروف العربية، لذا نستخدم negative lookahead يدوياً كحد للكلمة
+    const NB = '(?![\\u0621-\\u064A])';
+
+    const applyDelta = (unit, amount) => {
+        const d = new Date(now);
+        if (unit === 'second') d.setSeconds(d.getSeconds() - amount);
+        else if (unit === 'minute') d.setMinutes(d.getMinutes() - amount);
+        else if (unit === 'hour') d.setHours(d.getHours() - amount);
+        else if (unit === 'day') d.setDate(d.getDate() - amount);
+        else if (unit === 'week') d.setDate(d.getDate() - amount * 7);
+        else if (unit === 'month') d.setMonth(d.getMonth() - amount);
+        else if (unit === 'year') d.setFullYear(d.getFullYear() - amount);
+        return d;
+    };
+
+    // أولاً: صيغة "منذ X وحدة" حيث X رقم صريح أو كلمة عدد (3 فأكثر عادة) — لها الأولوية لأنها أكثر تحديداً
+    const numberWords = {
+        'ثلاثة': 3, 'ثلاث': 3, 'أربعة': 4, 'أربع': 4, 'خمسة': 5, 'خمس': 5,
+        'ستة': 6, 'ست': 6, 'سبعة': 7, 'سبع': 7, 'ثمانية': 8, 'ثمان': 8,
+        'تسعة': 9, 'تسع': 9, 'عشرة': 10, 'عشر': 10,
+    };
+    const numMatch = cleaned.match(/منذ\s+([\u0621-\u064A0-9]+)\s+(ثانية|ثواني|دقيقة|دقائق|ساعة|ساعات|يوم|أيام|أسبوع|أسابيع|شهر|أشهر|سنة|سنوات)/);
+    if (numMatch) {
+        let amount = parseInt(numMatch[1], 10);
+        if (isNaN(amount)) amount = numberWords[numMatch[1]] ?? null;
+        if (amount !== null) {
+            const unitRaw = numMatch[2];
+            let unit = null;
+            if (/ثانية|ثواني/.test(unitRaw)) unit = 'second';
+            else if (/دقيقة|دقائق/.test(unitRaw)) unit = 'minute';
+            else if (/ساعة|ساعات/.test(unitRaw)) unit = 'hour';
+            else if (/يوم|أيام/.test(unitRaw)) unit = 'day';
+            else if (/أسبوع|أسابيع/.test(unitRaw)) unit = 'week';
+            else if (/شهر|أشهر/.test(unitRaw)) unit = 'month';
+            else if (/سنة|سنوات/.test(unitRaw)) unit = 'year';
+            if (unit) return applyDelta(unit, amount);
+        }
+    }
+
+    // ثانياً: الصيغ المفردة/المثناة بدون رقم منفصل ("منذ ساعة"، "منذ يومين"، "منذ أسبوع"...)
+    const bareUnitWords = [
+        { re: new RegExp(`منذ\\s+ثانيتين${NB}`), amount: 2, unit: 'second' },
+        { re: new RegExp(`منذ\\s+ثانية${NB}`), amount: 1, unit: 'second' },
+        { re: new RegExp(`منذ\\s+دقيقتين${NB}`), amount: 2, unit: 'minute' },
+        { re: new RegExp(`منذ\\s+دقيقة${NB}`), amount: 1, unit: 'minute' },
+        { re: new RegExp(`منذ\\s+ساعتين${NB}`), amount: 2, unit: 'hour' },
+        { re: new RegExp(`منذ\\s+ساعة${NB}`), amount: 1, unit: 'hour' },
+        { re: new RegExp(`منذ\\s+يومين${NB}`), amount: 2, unit: 'day' },
+        { re: new RegExp(`منذ\\s+يوم${NB}`), amount: 1, unit: 'day' },
+        { re: new RegExp(`منذ\\s+أسبوعين${NB}`), amount: 2, unit: 'week' },
+        { re: new RegExp(`منذ\\s+أسبوع${NB}`), amount: 1, unit: 'week' },
+        { re: new RegExp(`منذ\\s+شهرين${NB}`), amount: 2, unit: 'month' },
+        { re: new RegExp(`منذ\\s+شهر${NB}`), amount: 1, unit: 'month' },
+        { re: new RegExp(`منذ\\s+سنتين${NB}`), amount: 2, unit: 'year' },
+        { re: new RegExp(`منذ\\s+سنة${NB}`), amount: 1, unit: 'year' },
+    ];
+    for (const { re, amount, unit } of bareUnitWords) {
+        if (re.test(cleaned)) return applyDelta(unit, amount);
+    }
+
+    return null;
+}
+
 async function fetchDetail(page, url, reqLog) {
     await page.route('**/*', (route) => {
         const type = route.request().resourceType();
@@ -211,68 +288,6 @@ async function fetchDetail(page, url, reqLog) {
         const el = document.querySelector('#__NEXT_DATA__');
         return el ? el.textContent : null;
     });
-
-    // 🔍 تشخيص لمرة واحدة فقط: يفحص أول إعلان بعمق لمعرفة أين يقع التاريخ فعلاً
-    if (!global.__dateDebugDone) {
-        global.__dateDebugDone = true;
-        reqLog.info(`🔬 [تشخيص عميق - إعلان واحد فقط] __NEXT_DATA__ موجود؟ ${!!nextDataText} | الحجم: ${nextDataText ? nextDataText.length : 0} حرف`);
-
-        if (nextDataText) {
-            try {
-                const debugData = JSON.parse(nextDataText);
-                const dateLikeFindings = [];
-                const seenPaths = new Set();
-
-                const scanForDates = (obj, path = '', depth = 0) => {
-                    if (depth > 12 || !obj || typeof obj !== 'object') return;
-                    for (const [key, value] of Object.entries(obj)) {
-                        const fullPath = path ? `${path}.${key}` : key;
-                        if (/date|created|publish|time|added|posted|updated|issue/i.test(key)) {
-                            if (!seenPaths.has(fullPath) && (typeof value === 'string' || typeof value === 'number')) {
-                                seenPaths.add(fullPath);
-                                dateLikeFindings.push(`${fullPath} = ${JSON.stringify(value)}`);
-                            }
-                        }
-                        if (value && typeof value === 'object' && dateLikeFindings.length < 40) {
-                            scanForDates(value, fullPath, depth + 1);
-                        }
-                    }
-                };
-                scanForDates(debugData);
-
-                if (dateLikeFindings.length > 0) {
-                    reqLog.info(`🔬 حقول تشبه التاريخ وُجدت في __NEXT_DATA__ (${dateLikeFindings.length}):`);
-                    for (const f of dateLikeFindings.slice(0, 30)) {
-                        reqLog.info(`   • ${f}`);
-                    }
-                } else {
-                    reqLog.info('🔬 لا يوجد أي حقل يشبه التاريخ في __NEXT_DATA__ إطلاقاً.');
-                }
-            } catch (e) {
-                reqLog.warning(`🔬 فشل تحليل __NEXT_DATA__ أثناء التشخيص: ${e.message}`);
-            }
-        }
-
-        // فحص DOM أيضاً عن أي نص يحتوي كلمات دالة على تاريخ النشر
-        const domDateHints = await page.evaluate(() => {
-            const hints = [];
-            const all = document.querySelectorAll('*');
-            const re = /نُشر|تاريخ النشر|تاريخ الإضافة|منذ|added|posted/i;
-            for (const el of all) {
-                if (el.children.length === 0 && el.textContent && re.test(el.textContent) && el.textContent.length < 60) {
-                    hints.push(`<${el.tagName.toLowerCase()} class="${el.className}"> = "${el.textContent.trim()}"`);
-                    if (hints.length >= 15) break;
-                }
-            }
-            return hints;
-        });
-        if (domDateHints.length > 0) {
-            reqLog.info(`🔬 عناصر DOM تحتوي كلمات دالة على تاريخ (${domDateHints.length}):`);
-            for (const h of domDateHints) reqLog.info(`   • ${h}`);
-        } else {
-            reqLog.info('🔬 لا يوجد عنصر DOM ظاهر يحتوي كلمات دالة على تاريخ النشر.');
-        }
-    }
 
     let posted_at = '';
     let posted_at_iso = '';
@@ -327,21 +342,42 @@ async function fetchDetail(page, url, reqLog) {
     }
 
     if (!posted_at) {
-        const domDate = await page.evaluate(() => {
-            const el = document.querySelector('time[datetime], [class*="date"], [class*="publish"]');
-            return el?.getAttribute('datetime') || el?.innerText?.trim() || '';
+        // البحث المستهدف: نص يحتوي "منذ ..." بجانب تسمية "تاريخ الإضافة"، بناءً على البنية الفعلية للموقع
+        const domDateRaw = await page.evaluate(() => {
+            const all = document.querySelectorAll('*');
+            for (const el of all) {
+                if (el.children.length === 0 && el.textContent && /^منذ\s/.test(el.textContent.trim()) && el.textContent.length < 40) {
+                    return el.textContent.trim();
+                }
+            }
+            // fallback أوسع: أي عنصر تاريخ صريح
+            const timeEl = document.querySelector('time[datetime], [class*="date"], [class*="publish"]');
+            return timeEl?.getAttribute('datetime') || timeEl?.innerText?.trim() || '';
         });
-        if (domDate) {
-            const d = new Date(domDate);
-            if (!isNaN(d.getTime())) {
-                posted_at_iso = d.toISOString();
-                posted_at = d.toLocaleString('ar-SA', {
+
+        if (domDateRaw) {
+            // أولاً نحاول تحليله كنص نسبي عربي ("منذ 9 ساعات تقريباً")
+            const relativeDate = parseArabicRelativeDate(domDateRaw);
+            if (relativeDate) {
+                posted_at_iso = relativeDate.toISOString();
+                posted_at = relativeDate.toLocaleString('ar-SA', {
                     timeZone: 'Asia/Riyadh',
                     year: 'numeric', month: '2-digit', day: '2-digit',
                     hour: '2-digit', minute: '2-digit',
                 });
             } else {
-                posted_at = domDate;
+                // وإلا نحاول تحليله كتاريخ قياسي (ISO أو مشابه)
+                const d = new Date(domDateRaw);
+                if (!isNaN(d.getTime())) {
+                    posted_at_iso = d.toISOString();
+                    posted_at = d.toLocaleString('ar-SA', {
+                        timeZone: 'Asia/Riyadh',
+                        year: 'numeric', month: '2-digit', day: '2-digit',
+                        hour: '2-digit', minute: '2-digit',
+                    });
+                } else {
+                    posted_at = domDateRaw; // نحفظ النص الخام على الأقل، حتى لو تعذّر تحويله
+                }
             }
         }
     }
@@ -355,7 +391,7 @@ const crawler = new PlaywrightCrawler({
     proxyConfiguration,
     maxConcurrency: 1, // ⭐ تسلسلي إجبارياً في وضع اليوم لضمان التوقف الدقيق عند أول إعلان قديم
     maxRequestsPerCrawl: todayOnly ? 300 : maxResults + 60,
-    requestHandlerTimeoutSecs: 600,
+    requestHandlerTimeoutSecs: 240,
     navigationTimeoutSecs: 60,
 
     async requestHandler({ page, request, log: reqLog }) {
@@ -410,6 +446,7 @@ const crawler = new PlaywrightCrawler({
             // وضع "اليوم فقط": نفتح كل إعلان بالتسلسل داخل نفس معالج الصفحة
             // ونتوقف فوراً عند أول إعلان أقدم من اليوم
             // ==========================================
+                        
             if (todayOnly) {
                 let sawOlderThanToday = false;
 
@@ -595,3 +632,4 @@ if (webhookUrl && webhookUrl.trim()) {
 }
 
 await Actor.exit();
+                      
