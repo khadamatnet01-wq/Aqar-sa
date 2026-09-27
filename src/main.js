@@ -211,6 +211,68 @@ async function fetchDetail(page, url, reqLog) {
         return el ? el.textContent : null;
     });
 
+    // 🔍 تشخيص لمرة واحدة فقط: يفحص أول إعلان بعمق لمعرفة أين يقع التاريخ فعلاً
+    if (!global.__dateDebugDone) {
+        global.__dateDebugDone = true;
+        reqLog.info(`🔬 [تشخيص عميق - إعلان واحد فقط] __NEXT_DATA__ موجود؟ ${!!nextDataText} | الحجم: ${nextDataText ? nextDataText.length : 0} حرف`);
+
+        if (nextDataText) {
+            try {
+                const debugData = JSON.parse(nextDataText);
+                const dateLikeFindings = [];
+                const seenPaths = new Set();
+
+                const scanForDates = (obj, path = '', depth = 0) => {
+                    if (depth > 12 || !obj || typeof obj !== 'object') return;
+                    for (const [key, value] of Object.entries(obj)) {
+                        const fullPath = path ? `${path}.${key}` : key;
+                        if (/date|created|publish|time|added|posted|updated|issue/i.test(key)) {
+                            if (!seenPaths.has(fullPath) && (typeof value === 'string' || typeof value === 'number')) {
+                                seenPaths.add(fullPath);
+                                dateLikeFindings.push(`${fullPath} = ${JSON.stringify(value)}`);
+                            }
+                        }
+                        if (value && typeof value === 'object' && dateLikeFindings.length < 40) {
+                            scanForDates(value, fullPath, depth + 1);
+                        }
+                    }
+                };
+                scanForDates(debugData);
+
+                if (dateLikeFindings.length > 0) {
+                    reqLog.info(`🔬 حقول تشبه التاريخ وُجدت في __NEXT_DATA__ (${dateLikeFindings.length}):`);
+                    for (const f of dateLikeFindings.slice(0, 30)) {
+                        reqLog.info(`   • ${f}`);
+                    }
+                } else {
+                    reqLog.info('🔬 لا يوجد أي حقل يشبه التاريخ في __NEXT_DATA__ إطلاقاً.');
+                }
+            } catch (e) {
+                reqLog.warning(`🔬 فشل تحليل __NEXT_DATA__ أثناء التشخيص: ${e.message}`);
+            }
+        }
+
+        // فحص DOM أيضاً عن أي نص يحتوي كلمات دالة على تاريخ النشر
+        const domDateHints = await page.evaluate(() => {
+            const hints = [];
+            const all = document.querySelectorAll('*');
+            const re = /نُشر|تاريخ النشر|تاريخ الإضافة|منذ|added|posted/i;
+            for (const el of all) {
+                if (el.children.length === 0 && el.textContent && re.test(el.textContent) && el.textContent.length < 60) {
+                    hints.push(`<${el.tagName.toLowerCase()} class="${el.className}"> = "${el.textContent.trim()}"`);
+                    if (hints.length >= 15) break;
+                }
+            }
+            return hints;
+        });
+        if (domDateHints.length > 0) {
+            reqLog.info(`🔬 عناصر DOM تحتوي كلمات دالة على تاريخ (${domDateHints.length}):`);
+            for (const h of domDateHints) reqLog.info(`   • ${h}`);
+        } else {
+            reqLog.info('🔬 لا يوجد عنصر DOM ظاهر يحتوي كلمات دالة على تاريخ النشر.');
+        }
+    }
+
     let posted_at = '';
     let posted_at_iso = '';
     let bedrooms = '';
@@ -292,7 +354,7 @@ const crawler = new PlaywrightCrawler({
     proxyConfiguration,
     maxConcurrency: 1, // ⭐ تسلسلي إجبارياً في وضع اليوم لضمان التوقف الدقيق عند أول إعلان قديم
     maxRequestsPerCrawl: todayOnly ? 300 : maxResults + 60,
-    requestHandlerTimeoutSecs: 180,
+    requestHandlerTimeoutSecs: 600,
     navigationTimeoutSecs: 60,
 
     async requestHandler({ page, request, log: reqLog }) {
