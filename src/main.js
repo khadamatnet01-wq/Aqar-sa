@@ -1,941 +1,1752 @@
-import { Actor } from 'apify';
-import { PlaywrightCrawler, log } from 'crawlee';
+// -*- coding: utf-8 -*-
+
+import { Actor, log } from 'apify';
 
 await Actor.init();
 
 const input = await Actor.getInput() || {};
 
 const {
-  startUrl = '',
-  search = 'فلل-للبيع',
-  city = 'الرياض',
-  subArea = '',
-  district = '',
+    startUrl = '',
+    search = 'فلل-للبيع',
+    city = 'الرياض',
+    subArea = '',
+    district = '',
 
-  maxResults = 20,
-  maxPagesToScan = 30,
+    maxResults = 20,
+    maxPagesToScan = 10,
 
-  todayOnly = true,
-  fetchPhoneFromDetail = true,
+    todayOnly = true,
+    fetchPhoneFromDetail = true,
 
-  webhookUrl = '',
+    concurrency = 8,
 
-  proxyConfiguration: proxyInput
+    webhookUrl = '',
+
+    proxyConfiguration: proxyInput
 } = input;
 
-const MAX_RESULTS = Math.max(1, Number(maxResults) || 20);
-const MAX_PAGES = Math.max(1, Number(maxPagesToScan) || 30);
+const MAX_RESULTS =
+    Math.max(1, Number(maxResults) || 20);
+
+const MAX_PAGES =
+    Math.max(1, Number(maxPagesToScan) || 10);
+
+const CONCURRENCY =
+    Math.min(
+        20,
+        Math.max(1, Number(concurrency) || 8)
+    );
 
 const TODAY_ONLY =
-  todayOnly === true ||
-  todayOnly === 'true';
+    todayOnly === true ||
+    todayOnly === 'true';
 
 const FETCH_PHONE =
-  fetchPhoneFromDetail === true ||
-  fetchPhoneFromDetail === 'true';
+    fetchPhoneFromDetail === true ||
+    fetchPhoneFromDetail === 'true';
 
 const proxyConfiguration =
-  await Actor.createProxyConfiguration(
-    proxyInput || {
-      useApifyProxy: true,
-      groups: ['RESIDENTIAL']
-    }
-  );
+    await Actor.createProxyConfiguration(
+        proxyInput || {
+            useApifyProxy: true,
+            groups: ['RESIDENTIAL']
+        }
+    );
 
 const results = [];
-const discovered = new Set();
-const detailQueued = new Set();
+const seen = new Set();
 
 let pagesScanned = 0;
 let detailsChecked = 0;
-let noDateCount = 0;
+let dateFound = 0;
+let dateMissing = 0;
 
-const TODAY = new Intl.DateTimeFormat('en-CA', {
-  timeZone: 'Asia/Riyadh',
-  year: 'numeric',
-  month: '2-digit',
-  day: '2-digit'
-}).format(new Date());
+const TODAY = new Intl.DateTimeFormat(
+    'en-CA',
+    {
+        timeZone: 'Asia/Riyadh',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit'
+    }
+).format(new Date());
+
+log.info(`📅 تاريخ الرياض: ${TODAY}`);
+log.info(`⚡ HTTP mode`);
+log.info(`⚡ Concurrency: ${CONCURRENCY}`);
+log.info(`🎯 الحد: ${MAX_RESULTS}`);
 
 function normalize(value) {
-  return String(value || '')
-    .trim()
-    .replace(/\s+/g, '-')
-    .replace(/^-+|-+$/g, '');
-}
-
-function arabicDigits(value) {
-  return String(value || '')
-    .replace(/[٠-٩]/g, d =>
-      String('٠١٢٣٤٥٦٧٨٩'.indexOf(d))
-    )
-    .replace(/[۰-۹]/g, d =>
-      String('۰۱۲۳۴۵۶۷۸۹'.indexOf(d))
-    );
+    return String(value || '')
+        .trim()
+        .replace(/\s+/g, '-')
+        .replace(/^-+|-+$/g, '');
 }
 
 function buildBaseUrl() {
-  if (String(startUrl).trim()) {
-    return String(startUrl).trim().replace(/\/+$/, '');
-  }
+    if (String(startUrl).trim()) {
+        return String(startUrl)
+            .trim()
+            .replace(/\/+$/, '');
+    }
 
-  const parts = [
-    search,
-    city,
-    subArea,
-    district
-  ]
-    .map(normalize)
-    .filter(Boolean);
+    const parts = [
+        search,
+        city,
+        subArea,
+        district
+    ]
+        .map(normalize)
+        .filter(Boolean);
 
-  return `https://sa.aqar.fm/${parts
-    .map(encodeURI)
-    .join('/')}`;
+    return `https://sa.aqar.fm/${parts
+        .map(encodeURI)
+        .join('/')}`;
 }
 
-function pageUrl(base, page) {
-  return page === 1
-    ? base
-    : `${base}/${page}`;
+function getPageUrl(page) {
+    const base = buildBaseUrl();
+
+    return page === 1
+        ? base
+        : `${base}/${page}`;
 }
 
-function extractId(url) {
-  const m = String(url || '').match(
-    /-(\d{5,})(?:\/)?(?:[?#].*)?$/
-  );
-
-  return m?.[1] || '';
+function arabicDigits(value) {
+    return String(value || '')
+        .replace(/[٠-٩]/g, d =>
+            String(
+                '٠١٢٣٤٥٦٧٨٩'
+                    .indexOf(d)
+            )
+        )
+        .replace(/[۰-۹]/g, d =>
+            String(
+                '۰۱۲۳۴۵۶۷۸۹'
+                    .indexOf(d)
+            )
+        );
 }
 
 function normalizePhone(value) {
-  let p = arabicDigits(value)
-    .replace(/[^\d+]/g, '');
+    let phone = arabicDigits(value)
+        .replace(/[^\d+]/g, '');
 
-  if (p.startsWith('+9665')) {
-    p = '0' + p.slice(4);
-  } else if (p.startsWith('9665')) {
-    p = '0' + p.slice(3);
-  } else if (p.startsWith('5')) {
-    p = '0' + p;
-  }
+    if (phone.startsWith('+9665')) {
+        phone =
+            '0' +
+            phone.slice(4);
+    }
 
-  return /^05\d{8}$/.test(p)
-    ? p
-    : '';
+    if (phone.startsWith('9665')) {
+        phone =
+            '0' +
+            phone.slice(3);
+    }
+
+    if (phone.startsWith('5')) {
+        phone =
+            '0' +
+            phone;
+    }
+
+    return /^05\d{8}$/.test(phone)
+        ? phone
+        : '';
 }
 
-function findPhone(text) {
-  const s = arabicDigits(text)
-    .replace(/[\s\-().]/g, '');
+function extractPhone(text) {
+    const value =
+        arabicDigits(text)
+            .replace(/[\s\-().]/g, '');
 
-  const m = s.match(
-    /(?:\+966|966|0)?5\d{8}/
-  );
+    const match =
+        value.match(
+            /(?:\+966|966|0)?5\d{8}/
+        );
 
-  return m
-    ? normalizePhone(m[0])
-    : '';
+    return match
+        ? normalizePhone(match[0])
+        : '';
 }
 
-function dateFromParts(y, m, d) {
-  const year = Number(y);
-  const month = Number(m);
-  const day = Number(d);
+function dateFromParts(
+    year,
+    month,
+    day
+) {
+    const y = Number(year);
+    const m = Number(month);
+    const d = Number(day);
 
-  if (
-    year < 2000 ||
-    year > 2100 ||
-    month < 1 ||
-    month > 12 ||
-    day < 1 ||
-    day > 31
-  ) {
+    if (
+        y < 2000 ||
+        y > 2100 ||
+        m < 1 ||
+        m > 12 ||
+        d < 1 ||
+        d > 31
+    ) {
+        return null;
+    }
+
+    const date = new Date(
+        `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}T12:00:00+03:00`
+    );
+
+    return Number.isNaN(
+        date.getTime()
+    )
+        ? null
+        : date;
+}
+
+function parseExplicitDate(value) {
+    if (!value) return null;
+
+    const text =
+        arabicDigits(value)
+            .trim();
+
+    let match =
+        text.match(
+            /(?:^|\D)(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})(?:\D|$)/
+        );
+
+    if (match) {
+        return dateFromParts(
+            match[3],
+            match[2],
+            match[1]
+        );
+    }
+
+    match =
+        text.match(
+            /(?:^|\D)(\d{4})[\/\-.](\d{1,2})[\/\-.](\d{1,2})(?:\D|$)/
+        );
+
+    if (match) {
+        return dateFromParts(
+            match[1],
+            match[2],
+            match[3]
+        );
+    }
+
     return null;
-  }
+}
 
-  const dt = new Date(
-    `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}T12:00:00+03:00`
-  );
+function parseRelativeDate(value) {
+    if (!value) return null;
 
-  if (Number.isNaN(dt.getTime())) {
-    return null;
-  }
+    const text =
+        arabicDigits(value)
+            .replace(
+                /تقريباً|تقريبا|تقريب/g,
+                ''
+            )
+            .trim();
 
-  return dt;
+    const now = new Date();
+
+    if (
+        /اليوم|الآن|منذ لحظات|منذ قليل/
+            .test(text)
+    ) {
+        return now;
+    }
+
+    if (/أمس/.test(text)) {
+        now.setDate(
+            now.getDate() - 1
+        );
+
+        return now;
+    }
+
+    const words = {
+        ثلاثة: 3,
+        ثلاث: 3,
+        أربعة: 4,
+        أربع: 4,
+        خمسة: 5,
+        خمس: 5,
+        ستة: 6,
+        ست: 6,
+        سبعة: 7,
+        سبع: 7,
+        ثمانية: 8,
+        ثمان: 8,
+        تسعة: 9,
+        تسع: 9,
+        عشرة: 10,
+        عشر: 10
+    };
+
+    const match =
+        text.match(
+            /منذ\s+([\u0621-\u064A0-9]+)\s+(ثانية|ثواني|دقيقة|دقائق|ساعة|ساعات|يوم|أيام|أسبوع|أسابيع|شهر|أشهر|سنة|سنوات)/
+        );
+
+    if (!match) {
+        return null;
+    }
+
+    let amount =
+        Number(match[1]);
+
+    if (
+        Number.isNaN(amount)
+    ) {
+        amount =
+            words[match[1]];
+    }
+
+    if (!amount) {
+        return null;
+    }
+
+    const unit =
+        match[2];
+
+    if (/ثانية/.test(unit)) {
+        now.setSeconds(
+            now.getSeconds() - amount
+        );
+    } else if (/دقيقة/.test(unit)) {
+        now.setMinutes(
+            now.getMinutes() - amount
+        );
+    } else if (/ساعة/.test(unit)) {
+        now.setHours(
+            now.getHours() - amount
+        );
+    } else if (/يوم/.test(unit)) {
+        now.setDate(
+            now.getDate() - amount
+        );
+    } else if (/أسبوع/.test(unit)) {
+        now.setDate(
+            now.getDate() -
+            amount * 7
+        );
+    } else if (/شهر/.test(unit)) {
+        now.setMonth(
+            now.getMonth() - amount
+        );
+    } else if (/سنة/.test(unit)) {
+        now.setFullYear(
+            now.getFullYear() -
+            amount
+        );
+    }
+
+    return now;
 }
 
 function parseDate(value) {
-  if (!value) return null;
+    if (!value) return null;
 
-  const text = arabicDigits(
-    String(value)
-  ).trim();
-
-  let m = text.match(
-    /(?:^|\D)(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})(?:\D|$)/
-  );
-
-  if (m) {
-    return dateFromParts(
-      m[3],
-      m[2],
-      m[1]
+    return (
+        parseExplicitDate(value) ||
+        parseRelativeDate(value) ||
+        parseNativeDate(value)
     );
-  }
-
-  m = text.match(
-    /(?:^|\D)(\d{4})[\/\-.](\d{1,2})[\/\-.](\d{1,2})(?:\D|$)/
-  );
-
-  if (m) {
-    return dateFromParts(
-      m[1],
-      m[2],
-      m[3]
-    );
-  }
-
-  const native = new Date(text);
-
-  if (
-    !Number.isNaN(native.getTime()) &&
-    native.getFullYear() >= 2000
-  ) {
-    return native;
-  }
-
-  return null;
 }
 
-function relativeDate(value) {
-  if (!value) return null;
+function parseNativeDate(value) {
+    const date =
+        new Date(value);
 
-  const text = arabicDigits(
-    String(value)
-  ).trim();
+    if (
+        Number.isNaN(
+            date.getTime()
+        )
+    ) {
+        return null;
+    }
 
-  const now = new Date();
+    if (
+        date.getFullYear() < 2000
+    ) {
+        return null;
+    }
 
-  if (
-    /اليوم|الآن|منذ لحظات|منذ قليل/.test(text)
-  ) {
-    return now;
-  }
-
-  if (/أمس/.test(text)) {
-    now.setDate(now.getDate() - 1);
-    return now;
-  }
-
-  const m = text.match(
-    /منذ\s+(\d+)\s*(ثانية|ثواني|دقيقة|دقائق|ساعة|ساعات|يوم|أيام|أسبوع|أسابيع|شهر|أشهر|سنة|سنوات)/
-  );
-
-  if (!m) return null;
-
-  const amount = Number(m[1]);
-  const unit = m[2];
-
-  if (!amount) return null;
-
-  if (/ثانية/.test(unit)) {
-    now.setSeconds(
-      now.getSeconds() - amount
-    );
-  } else if (/دقيقة/.test(unit)) {
-    now.setMinutes(
-      now.getMinutes() - amount
-    );
-  } else if (/ساعة/.test(unit)) {
-    now.setHours(
-      now.getHours() - amount
-    );
-  } else if (/يوم/.test(unit)) {
-    now.setDate(
-      now.getDate() - amount
-    );
-  } else if (/أسبوع/.test(unit)) {
-    now.setDate(
-      now.getDate() - amount * 7
-    );
-  } else if (/شهر/.test(unit)) {
-    now.setMonth(
-      now.getMonth() - amount
-    );
-  } else if (/سنة/.test(unit)) {
-    now.setFullYear(
-      now.getFullYear() - amount
-    );
-  }
-
-  return now;
+    return date;
 }
 
 function isToday(date) {
-  if (!date) return false;
+    if (!date) return false;
 
-  const value =
-    new Intl.DateTimeFormat('en-CA', {
-      timeZone: 'Asia/Riyadh',
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit'
-    }).format(date);
+    const value =
+        new Intl.DateTimeFormat(
+            'en-CA',
+            {
+                timeZone:
+                    'Asia/Riyadh',
+                year: 'numeric',
+                month: '2-digit',
+                day: '2-digit'
+            }
+        ).format(date);
 
-  return value === TODAY;
+    return value === TODAY;
 }
 
 function formatDate(date) {
-  if (!date) return '';
+    if (!date) return '';
 
-  return date.toLocaleString('ar-SA', {
-    timeZone: 'Asia/Riyadh',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit'
-  });
+    return date.toLocaleString(
+        'en-GB',
+        {
+            timeZone:
+                'Asia/Riyadh',
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit',
+            hour: '2-digit',
+            minute: '2-digit',
+            hour12: false
+        }
+    );
 }
 
-async function extractListings(page) {
-  return await page.evaluate(() => {
+function listingId(url) {
+    const match =
+        String(url || '')
+            .match(
+                /-(\d{5,})(?:\/)?(?:[?#].*)?$/
+            );
+
+    return match
+        ? match[1]
+        : '';
+}
+
+function decodeHtml(value) {
+    return String(value || '')
+        .replace(/&quot;/g, '"')
+        .replace(/&#x27;/g, "'")
+        .replace(/&#39;/g, "'")
+        .replace(/&amp;/g, '&')
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>');
+}
+
+function stripTags(value) {
+    return decodeHtml(
+        String(value || '')
+            .replace(
+                /<script[\s\S]*?<\/script>/gi,
+                ' '
+            )
+            .replace(
+                /<style[\s\S]*?<\/style>/gi,
+                ' '
+            )
+            .replace(
+                /<[^>]+>/g,
+                ' '
+            )
+            .replace(
+                /\s+/g,
+                ' '
+            )
+            .trim()
+    );
+}
+
+/*
+ * يحاول استخراج نصوص RSC الخاصة بـ Next.js.
+ * عقار يستخدم Next.js App Router، لذلك لا نعتمد
+ * على __NEXT_DATA__ فقط.
+ */
+function extractRscScripts(html) {
+    const scripts = [];
+
+    const regex =
+        /<script[^>]*>([\s\S]*?)<\/script>/gi;
+
+    let match;
+
+    while (
+        (match = regex.exec(html))
+    ) {
+        const text =
+            match[1] || '';
+
+        if (
+            text.includes(
+                'self.__next_f.push'
+            )
+        ) {
+            scripts.push(text);
+        }
+    }
+
+    return scripts;
+}
+
+function extractRscStrings(html) {
+    const scripts =
+        extractRscScripts(html);
+
     const output = [];
-    const ids = new Set();
 
-    for (const a of document.querySelectorAll('a[href]')) {
-      const href = a.href || '';
+    for (const script of scripts) {
+        const regex =
+            /self\.__next_f\.push\(\s*\[\s*\d+\s*,\s*(".*?")\s*\]\s*\)/gs;
 
-      if (!href.includes('aqar.fm')) {
-        continue;
-      }
+        let match;
 
-      const idMatch = href.match(
-        /-(\d{5,})(?:\/)?(?:[?#].*)?$/
-      );
-
-      if (!idMatch) {
-        continue;
-      }
-
-      const id = idMatch[1];
-
-      if (ids.has(id)) {
-        continue;
-      }
-
-      ids.add(id);
-
-      const text = (
-        a.innerText || ''
-      ).trim();
-
-      if (!text) continue;
-
-      const lines = text
-        .split('\n')
-        .map(x => x.trim())
-        .filter(Boolean);
-
-      const title = lines[0] || '';
-
-      const price =
-        text.match(
-          /([\d,]+(?:\.\d+)?)\s*(?:ر\.س|ريال|﷼)/
-        )?.[1]
-        ?.replace(/,/g, '') || '';
-
-      const area =
-        text.match(
-          /([\d,]+)\s*م²/
-        )?.[1]
-        ?.replace(/,/g, '') || '';
-
-      const image =
-        a.querySelector('img')?.src ||
-        a.querySelector('img')?.getAttribute(
-          'data-src'
-        ) ||
-        '';
-
-      output.push({
-        id,
-        url: href,
-        title,
-        priceSar: price,
-        area_sqm: area,
-        description: lines
-          .slice(1)
-          .join(' ')
-          .trim(),
-        image,
-        listing_type:
-          /للإيجار/.test(text)
-            ? 'rent'
-            : 'sale'
-      });
+        while (
+            (match =
+                regex.exec(script))
+        ) {
+            try {
+                output.push(
+                    JSON.parse(match[1])
+                );
+            } catch {
+                output.push(
+                    match[1]
+                );
+            }
+        }
     }
 
     return output;
-  });
 }
 
-async function extractDetail(page) {
-  const bodyText =
-    await page.locator('body').innerText()
-      .catch(() => '');
+function findListingObjects(
+    html
+) {
+    const strings =
+        extractRscStrings(html);
 
-  let data = {
-    phone: '',
-    postedDate: null,
-    postedRaw: '',
-    bedrooms: '',
-    bathrooms: '',
-    ownerName: '',
-    verified: false,
-    license: ''
-  };
+    const combined =
+        strings.join('\n');
 
-  const nextData =
-    await page
-      .locator('#__NEXT_DATA__')
-      .textContent()
-      .catch(() => '');
+    const objects = [];
+    const used = new Set();
 
-  if (nextData) {
-    try {
-      const root =
-        JSON.parse(nextData);
+    /*
+     * نبحث عن كائنات تحتوي على ID
+     * ورابط/عنوان/سعر.
+     */
+    const patterns = [
+        /"id"\s*:\s*"(\d{5,})"/g,
+        /"id"\s*:\s*(\d{5,})/g,
+        /"propertyId"\s*:\s*"(\d{5,})"/g,
+        /"property_id"\s*:\s*"(\d{5,})"/g
+    ];
 
-      const candidates = [];
+    const ids = [];
 
-      function walk(obj, depth = 0) {
-        if (
-          !obj ||
-          typeof obj !== 'object' ||
-          depth > 10
+    for (const pattern of patterns) {
+        let match;
+
+        while (
+            (match =
+                pattern.exec(combined))
         ) {
-          return;
+            const id =
+                String(match[1]);
+
+            if (
+                !used.has(id)
+            ) {
+                used.add(id);
+                ids.push(id);
+            }
+        }
+    }
+
+    for (const id of ids) {
+        const index =
+            combined.indexOf(
+                `"${id}"`
+            );
+
+        if (index < 0) continue;
+
+        const start =
+            Math.max(
+                0,
+                index - 4000
+            );
+
+        const end =
+            Math.min(
+                combined.length,
+                index + 12000
+            );
+
+        const chunk =
+            combined.slice(
+                start,
+                end
+            );
+
+        const item =
+            parseListingChunk(
+                chunk,
+                id
+            );
+
+        if (item) {
+            objects.push(item);
+        }
+    }
+
+    return objects;
+}
+
+function extractValue(
+    text,
+    keys
+) {
+    for (const key of keys) {
+        const patterns = [
+            new RegExp(
+                `"${key}"\\s*:\\s*"([^"]*)"`
+            ),
+            new RegExp(
+                `"${key}"\\s*:\\s*([^,}\\n]+)`
+            )
+        ];
+
+        for (const pattern of patterns) {
+            const match =
+                text.match(pattern);
+
+            if (match) {
+                return String(
+                    match[1]
+                )
+                    .replace(/^["']|["']$/g, '')
+                    .trim();
+            }
+        }
+    }
+
+    return '';
+}
+
+function parseListingChunk(
+    chunk,
+    id
+) {
+    const title =
+        extractValue(
+            chunk,
+            [
+                'title',
+                'name',
+                'propertyTitle'
+            ]
+        );
+
+    const description =
+        extractValue(
+            chunk,
+            [
+                'description',
+                'desc'
+            ]
+        );
+
+    const price =
+        extractValue(
+            chunk,
+            [
+                'price',
+                'priceValue'
+            ]
+        );
+
+    const area =
+        extractValue(
+            chunk,
+            [
+                'area',
+                'areaSqm',
+                'area_sqm'
+            ]
+        );
+
+    const cityName =
+        extractValue(
+            chunk,
+            [
+                'city',
+                'cityName'
+            ]
+        );
+
+    const districtName =
+        extractValue(
+            chunk,
+            [
+                'district',
+                'districtName'
+            ]
+        );
+
+    const bedrooms =
+        extractValue(
+            chunk,
+            [
+                'bedrooms',
+                'beds',
+                'rooms'
+            ]
+        );
+
+    const bathrooms =
+        extractValue(
+            chunk,
+            [
+                'bathrooms',
+                'baths'
+            ]
+        );
+
+    const image =
+        extractValue(
+            chunk,
+            [
+                'mainImage',
+                'image',
+                'imageUrl',
+                'coverPhoto'
+            ]
+        );
+
+    const postedRaw =
+        extractValue(
+            chunk,
+            [
+                'postedAt',
+                'createdAt',
+                'created_at',
+                'publishedAt',
+                'published_at'
+            ]
+        );
+
+    const isFeatured =
+        /"isFeatured"\s*:\s*true/i
+            .test(chunk) ||
+        /"isPremium"\s*:\s*true/i
+            .test(chunk);
+
+    if (isFeatured) {
+        return null;
+    }
+
+    if (
+        !title &&
+        !price &&
+        !description
+    ) {
+        return null;
+    }
+
+    const type =
+        /إيجار|للايجار|للإيجار/
+            .test(
+                `${title} ${description}`
+            )
+            ? 'rent'
+            : 'sale';
+
+    const url =
+        findListingUrl(
+            chunk,
+            id
+        );
+
+    return {
+        _raw_id: id,
+
+        name: title,
+
+        priceSar:
+            price.replace(
+                /,/g,
+                ''
+            ),
+
+        listing_type: type,
+
+        area_sqm:
+            area.replace(
+                /,/g,
+                ''
+            ),
+
+        city:
+            cityName,
+
+        district:
+            districtName,
+
+        description,
+
+        bedrooms,
+
+        bathrooms,
+
+        postedRaw,
+
+        postedDate:
+            parseDate(
+                postedRaw
+            ),
+
+        images:
+            image
+                ? [image]
+                : [],
+
+        has_image:
+            Boolean(image),
+
+        url:
+            url ||
+            `https://sa.aqar.fm/${id}`
+    };
+}
+
+function findListingUrl(
+    chunk,
+    id
+) {
+    const patterns = [
+        new RegExp(
+            `"url"\\s*:\\s*"([^"]*${id}[^"]*)"`
+        ),
+        new RegExp(
+            `"(?:href|link)"\\s*:\\s*"([^"]*${id}[^"]*)"`
+        )
+    ];
+
+    for (
+        const pattern of patterns
+    ) {
+        const match =
+            chunk.match(pattern);
+
+        if (match) {
+            return decodeHtml(
+                match[1]
+            )
+                .replace(
+                    /\\u002F/g,
+                    '/'
+                )
+                .replace(
+                    /\\\//g,
+                    '/'
+                );
+        }
+    }
+
+    return '';
+}
+
+function parseDomCards(html) {
+    const results = [];
+    const ids = new Set();
+
+    const regex =
+        /href=["']([^"']*-(\d{5,})(?:[?#][^"']*)?)["'][^>]*>([\s\S]*?)<\/a>/gi;
+
+    let match;
+
+    while (
+        (match =
+            regex.exec(html))
+    ) {
+        const url =
+            decodeHtml(
+                match[1]
+            );
+
+        const id =
+            match[2];
+
+        if (
+            ids.has(id)
+        ) {
+            continue;
         }
 
+        ids.add(id);
+
+        const text =
+            stripTags(
+                match[3]
+            );
+
+        if (!text) continue;
+
         if (
-          obj.createdAt ||
-          obj.created_at ||
-          obj.published_at ||
-          obj.posted_at
+            /^مميز/.test(text)
         ) {
-          candidates.push(obj);
+            continue;
+        }
+
+        const price =
+            text.match(
+                /([\d,]+(?:\.\d+)?)\s*(?:ر\.س|ريال|﷼|§)/
+            )?.[1] || '';
+
+        const area =
+            text.match(
+                /([\d,]+)\s*م²/
+            )?.[1] || '';
+
+        results.push({
+            _raw_id: id,
+
+            name:
+                text.split(/\s{2,}/)[0] ||
+                text.slice(0, 100),
+
+            priceSar:
+                price.replace(/,/g, ''),
+
+            listing_type:
+                /إيجار|للإيجار|للايجار/
+                    .test(text)
+                    ? 'rent'
+                    : 'sale',
+
+            area_sqm:
+                area.replace(/,/g, ''),
+
+            description:
+                text,
+
+            url:
+                url.startsWith('http')
+                    ? url
+                    : `https://sa.aqar.fm${url}`,
+
+            images: [],
+
+            has_image: false
+        });
+    }
+
+    return results;
+}
+
+function mergeListings(
+    primary,
+    fallback
+) {
+    const map = new Map();
+
+    for (
+        const item of fallback
+    ) {
+        map.set(
+            item._raw_id,
+            item
+        );
+    }
+
+    for (
+        const item of primary
+    ) {
+        const old =
+            map.get(
+                item._raw_id
+            );
+
+        map.set(
+            item._raw_id,
+            {
+                ...old,
+                ...item,
+                url:
+                    item.url ||
+                    old?.url ||
+                    ''
+            }
+        );
+    }
+
+    return [...map.values()];
+}
+
+async function fetchText(
+    url,
+    timeout = 30000
+) {
+    const proxy =
+        await proxyConfiguration.newUrl();
+
+    const controller =
+        new AbortController();
+
+    const timer =
+        setTimeout(
+            () =>
+                controller.abort(),
+            timeout
+        );
+
+    try {
+        const response =
+            await fetch(
+                url,
+                {
+                    headers: {
+                        'User-Agent':
+                            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36',
+                        'Accept':
+                            'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                        'Accept-Language':
+                            'ar-SA,ar;q=0.9,en;q=0.8',
+                        'Cache-Control':
+                            'no-cache'
+                    },
+
+                    signal:
+                        controller.signal,
+
+                    ...(proxy
+                        ? {
+                            dispatcher:
+                                undefined
+                        }
+                        : {})
+                }
+            );
+
+        if (!response.ok) {
+            throw new Error(
+                `HTTP ${response.status}`
+            );
+        }
+
+        return await response.text();
+
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+function parseDetailHtml(
+    html
+) {
+    const text =
+        stripTags(html);
+
+    let phone =
+        extractPhone(text);
+
+    let postedDate = null;
+    let postedRaw = '';
+
+    let bedrooms = '';
+    let bathrooms = '';
+
+    let ownerName = '';
+    let license = '';
+
+    let verified = false;
+
+    const datePatterns = [
+        /تاريخ الإضافة\s*[:：-]?\s*([^\n]{1,50})/i,
+        /تاريخ الإعلان\s*[:：-]?\s*([^\n]{1,50})/i,
+        /أضيف\s*[:：-]?\s*([^\n]{1,50})/i
+    ];
+
+    for (
+        const pattern of datePatterns
+    ) {
+        const match =
+            text.match(pattern);
+
+        if (!match) continue;
+
+        const date =
+            parseDate(
+                match[1]
+            );
+
+        if (date) {
+            postedRaw =
+                match[1].trim();
+
+            postedDate =
+                date;
+
+            break;
+        }
+    }
+
+    if (!postedDate) {
+        const iso =
+            html.match(
+                /"(?:createdAt|created_at|postedAt|publishedAt|published_at)"\s*:\s*"([^"]+)"/
+            );
+
+        if (iso) {
+            const date =
+                parseDate(
+                    iso[1]
+                );
+
+            if (date) {
+                postedRaw =
+                    iso[1];
+
+                postedDate =
+                    date;
+            }
+        }
+    }
+
+    if (!bedrooms) {
+        bedrooms =
+            text.match(
+                /(\d+)\s*(?:غرف|غرفة)/
+            )?.[1] || '';
+    }
+
+    if (!bathrooms) {
+        bathrooms =
+            text.match(
+                /(\d+)\s*(?:حمامات|حمام)/
+            )?.[1] || '';
+    }
+
+    const licenseMatch =
+        text.match(
+            /(?:رخصة فال|رخصه فال|فال|ترخيص)\s*:?\s*(\d{6,})/
+        );
+
+    if (licenseMatch) {
+        license =
+            licenseMatch[1];
+    }
+
+    const ownerMatch =
+        text.match(
+            /(?:المعلن|المعلن عنه|صاحب الإعلان)\s*:?\s*([^\n]{2,80})/
+        );
+
+    if (ownerMatch) {
+        ownerName =
+            ownerMatch[1]
+                .trim();
+    }
+
+    verified =
+        /موثق|موثقة|verified/i
+            .test(text);
+
+    return {
+        phone,
+        postedDate,
+        postedRaw,
+        bedrooms,
+        bathrooms,
+        ownerName,
+        license,
+        verified
+    };
+}
+
+async function fetchDetail(
+    listing
+) {
+    if (!listing.url) {
+        return null;
+    }
+
+    try {
+        const html =
+            await fetchText(
+                listing.url,
+                25000
+            );
+
+        return parseDetailHtml(
+            html
+        );
+
+    } catch (error) {
+        log.warning(
+            `⚠️ detail ${listing._raw_id}: ${error.message}`
+        );
+
+        return null;
+    }
+}
+
+async function mapConcurrent(
+    items,
+    limit,
+    worker
+) {
+    const output = new Array(
+        items.length
+    );
+
+    let index = 0;
+
+    async function runner() {
+        while (true) {
+            const current =
+                index++;
+
+            if (
+                current >=
+                items.length
+            ) {
+                return;
+            }
+
+            output[current] =
+                await worker(
+                    items[current],
+                    current
+                );
+        }
+    }
+
+    const workers =
+        Array.from(
+            {
+                length:
+                    Math.min(
+                        limit,
+                        items.length
+                    )
+            },
+            () =>
+                runner()
+        );
+
+    await Promise.all(
+        workers
+    );
+
+    return output;
+}
+
+async function processPage(
+    pageNumber
+) {
+    const url =
+        getPageUrl(
+            pageNumber
+        );
+
+    log.info(
+        `📄 صفحة ${pageNumber}: ${url}`
+    );
+
+    const html =
+        await fetchText(
+            url,
+            30000
+        );
+
+    let listings =
+        findListingObjects(
+            html
+        );
+
+    const dom =
+        parseDomCards(
+            html
+        );
+
+    listings =
+        mergeListings(
+            listings,
+            dom
+        );
+
+    log.info(
+        `🔎 صفحة ${pageNumber}: ${listings.length} إعلان`
+    );
+
+    return listings;
+}
+
+const allListings = [];
+
+for (
+    let page = 1;
+    page <= MAX_PAGES;
+    page++
+) {
+    if (
+        allListings.length >=
+        MAX_RESULTS * 4
+    ) {
+        break;
+    }
+
+    try {
+        const listings =
+            await processPage(
+                page
+            );
+
+        pagesScanned++;
+
+        if (
+            listings.length === 0
+        ) {
+            log.info(
+                `ℹ️ لا توجد نتائج إضافية بعد الصفحة ${page}`
+            );
+
+            break;
         }
 
         for (
-          const value of Object.values(obj)
+            const listing of listings
         ) {
-          walk(value, depth + 1);
+            if (
+                !listing._raw_id ||
+                seen.has(
+                    listing._raw_id
+                )
+            ) {
+                continue;
+            }
+
+            seen.add(
+                listing._raw_id
+            );
+
+            allListings.push(
+                listing
+            );
         }
-      }
 
-      walk(root);
-
-      const item =
-        candidates.find(x =>
-          x.title ||
-          x.price ||
-          x.property_id ||
-          x.id
-        ) ||
-        candidates[0];
-
-      if (item) {
-        data.phone =
-          normalizePhone(
-            item.phone ||
-            item.mobile ||
-            item.mobile_number ||
-            item.contact_phone ||
-            ''
-          );
-
-        data.ownerName =
-          item.advertiser_name ||
-          item.owner_name ||
-          item.user?.name ||
-          '';
-
-        data.bedrooms = String(
-          item.bedrooms ??
-          item.rooms ??
-          ''
+    } catch (error) {
+        log.warning(
+            `⚠️ فشل الصفحة ${page}: ${error.message}`
         );
 
-        data.bathrooms = String(
-          item.bathrooms ??
-          ''
-        );
-
-        data.verified = Boolean(
-          item.is_verified ||
-          item.verified
-        );
-
-        data.license =
-          item.fal_license ||
-          item.rega_license ||
-          item.falLicense ||
-          '';
-
-        data.postedRaw =
-          item.created_at ||
-          item.createdAt ||
-          item.published_at ||
-          item.posted_at ||
-          '';
-
-        data.postedDate =
-          parseDate(
-            data.postedRaw
-          ) ||
-          relativeDate(
-            data.postedRaw
-          );
-      }
-    } catch {
-      // Continue with visible page data.
+        continue;
     }
-  }
-
-  if (!data.postedDate) {
-    const datePatterns = [
-      /(?:تاريخ الإضافة|تاريخ الإعلان)[\s:：-]*([^\n]{1,50})/i,
-      /(?:أضيف|نشر|نُشر)[\s:：-]*([^\n]{1,50})/i,
-      /(\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{4})/,
-      /(\d{4}[\/\-.]\d{1,2}[\/\-.]\d{1,2})/,
-      /(منذ\s+\d+\s+(?:دقيقة|دقائق|ساعة|ساعات|يوم|أيام|أسبوع|أسابيع))/i,
-      /(اليوم|أمس|منذ قليل|منذ لحظات)/i
-    ];
-
-    for (const pattern of datePatterns) {
-      const match =
-        bodyText.match(pattern);
-
-      if (!match) continue;
-
-      const raw =
-        match[1] || match[0];
-
-      const date =
-        parseDate(raw) ||
-        relativeDate(raw);
-
-      if (date) {
-        data.postedRaw = raw;
-        data.postedDate = date;
-        break;
-      }
-    }
-  }
-
-  if (!data.phone && FETCH_PHONE) {
-    data.phone =
-      findPhone(bodyText);
-
-    if (!data.phone) {
-      const tel =
-        await page
-          .locator('a[href^="tel:"]')
-          .first()
-          .getAttribute('href')
-          .catch(() => '');
-
-      data.phone =
-        normalizePhone(
-          tel?.replace(/^tel:/i, '')
-        );
-    }
-  }
-
-  if (!data.license) {
-    data.license =
-      bodyText.match(
-        /(?:رخصة فال|رخصه فال|ترخيص)\s*:?\s*(\d{6,})/
-      )?.[1] || '';
-  }
-
-  if (!data.bedrooms) {
-    data.bedrooms =
-      bodyText.match(
-        /(\d+)\s*(?:غرف|غرفة)/
-      )?.[1] || '';
-  }
-
-  if (!data.bathrooms) {
-    data.bathrooms =
-      bodyText.match(
-        /(\d+)\s*(?:حمامات|حمام)/
-      )?.[1] || '';
-  }
-
-  return data;
 }
 
-const baseUrl = buildBaseUrl();
-
 log.info(
-  `🔗 رابط البحث: ${baseUrl}`
+    `📦 إجمالي الإعلانات الخام: ${allListings.length}`
 );
 
-log.info(
-  `📅 التاريخ المستهدف: ${TODAY}`
-);
-
-const crawler =
-  new PlaywrightCrawler({
-    proxyConfiguration,
-
-    maxConcurrency: 2,
-
-    maxRequestsPerCrawl:
-      MAX_PAGES + MAX_RESULTS + 50,
-
-    requestHandlerTimeoutSecs: 90,
-
-    navigationTimeoutSecs: 45,
-
-    async requestHandler({
-      page,
-      request,
-      log: reqLog
-    }) {
-      const type =
-        request.userData?.type;
-
-      if (type === 'DETAIL') {
-        await handleDetail(
-          page,
-          request,
-          reqLog
-        );
-
-        return;
-      }
-
-      await handleList(
-        page,
-        request,
-        reqLog
-      );
-    },
-
-    async failedRequestHandler({
-      request,
-      error
-    }) {
-      log.error(
-        `❌ فشل: ${request.url} — ${error.message}`
-      );
-    }
-  });
-
-async function handleList(
-  page,
-  request,
-  reqLog
+if (
+    allListings.length === 0
 ) {
-  const pageNumber =
-    Number(
-      request.userData?.pageNumber
-    ) || 1;
-
-  pagesScanned++;
-
-  reqLog.info(
-    `📄 فحص الصفحة ${pageNumber}: ${request.url}`
-  );
-
-  await page.goto(
-    request.url,
-    {
-      waitUntil: 'domcontentloaded',
-      timeout: 45000
-    }
-  );
-
-  await page.waitForTimeout(1200);
-
-  const listings =
-    await extractListings(page);
-
-  reqLog.info(
-    `🔎 وجدنا ${listings.length} إعلان في الصفحة ${pageNumber}`
-  );
-
-  for (const item of listings) {
-    if (
-      discovered.has(item.id)
-    ) {
-      continue;
-    }
-
-    if (
-      results.length >= MAX_RESULTS
-    ) {
-      break;
-    }
-
-    discovered.add(item.id);
-
-    if (
-      detailQueued.has(item.id)
-    ) {
-      continue;
-    }
-
-    detailQueued.add(item.id);
-
-    await crawler.addRequests([
-      {
-        url: item.url,
-
-        uniqueKey:
-          `detail-${item.id}`,
-
-        userData: {
-          type: 'DETAIL',
-          listing: item
-        }
-      }
-    ]);
-  }
-
-  if (
-    pageNumber < MAX_PAGES &&
-    results.length < MAX_RESULTS
-  ) {
-    const next =
-      pageUrl(
-        baseUrl,
-        pageNumber + 1
-      );
-
-    await crawler.addRequests([
-      {
-        url: next,
-
-        uniqueKey:
-          `list-${pageNumber + 1}`,
-
-        userData: {
-          type: 'LIST',
-          pageNumber:
-            pageNumber + 1
-        }
-      }
-    ]);
-  }
-}
-
-async function handleDetail(
-  page,
-  request,
-  reqLog
-) {
-  if (
-    results.length >= MAX_RESULTS
-  ) {
-    return;
-  }
-
-  const listing =
-    request.userData.listing;
-
-  detailsChecked++;
-
-  reqLog.info(
-    `🔍 تفاصيل ${detailsChecked}: ${listing.id}`
-  );
-
-  try {
-    await page.goto(
-      request.url,
-      {
-        waitUntil:
-          'domcontentloaded',
-        timeout: 45000
-      }
-    );
-
-    await page.waitForTimeout(500);
-
-    const detail =
-      await extractDetail(page);
-
-    if (!detail.postedDate) {
-      noDateCount++;
-
-      reqLog.warning(
-        `⚠️ لم يتم العثور على تاريخ: ${listing.id}`
-      );
-
-      return;
-    }
-
-    const today =
-      isToday(detail.postedDate);
-
-    reqLog.info(
-      `${today ? '🟢' : '⚪'} ${listing.id} | ${formatDate(detail.postedDate)}`
-    );
-
-    if (
-      TODAY_ONLY &&
-      !today
-    ) {
-      return;
-    }
-
-    const item = {
-      ...listing,
-
-      source: 'aqar',
-
-      phone:
-        detail.phone || '',
-
-      posted_at:
-        formatDate(
-          detail.postedDate
-        ),
-
-      posted_at_iso:
-        detail.postedDate.toISOString(),
-
-      date_raw:
-        detail.postedRaw,
-
-      bedrooms:
-        detail.bedrooms,
-
-      bathrooms:
-        detail.bathrooms,
-
-      owner_name:
-        detail.ownerName,
-
-      is_verified:
-        detail.verified,
-
-      rega_license:
-        detail.license,
-
-      scanned_at:
-        new Date().toISOString()
-    };
-
-    results.push(item);
-
-    await Actor.pushData(item);
-
-    reqLog.info(
-      `✅ تم حفظ إعلان اليوم: ${listing.id} — ${results.length}/${MAX_RESULTS}`
-    );
-  } catch (error) {
-    reqLog.warning(
-      `⚠️ تعذر فحص ${listing.id}: ${error.message}`
-    );
-  }
-}
-
-await crawler.run([
-  {
-    url: pageUrl(
-      baseUrl,
-      1
-    ),
-
-    uniqueKey:
-      'list-1',
-
-    userData: {
-      type: 'LIST',
-      pageNumber: 1
-    }
-  }
-]);
-
-log.info(
-  `━━━━━━━━━━━━━━━━━━━━━━━━━━`
-);
-
-log.info(
-  `🎯 النتائج النهائية: ${results.length}`
-);
-
-log.info(
-  `📄 الصفحات المفحوصة: ${pagesScanned}`
-);
-
-log.info(
-  `🔍 التفاصيل المفحوصة: ${detailsChecked}`
-);
-
-log.info(
-  `⚠️ إعلانات بدون تاريخ: ${noDateCount}`
-);
-
-log.info(
-  `📅 وضع اليوم فقط: ${TODAY_ONLY}`
-);
-
-if (webhookUrl?.trim()) {
-  try {
-    const datasetId =
-      process.env.APIFY_DEFAULT_DATASET_ID;
-
-    if (datasetId) {
-      await fetch(
-        webhookUrl.trim(),
-        {
-          method: 'POST',
-
-          headers: {
-            'Content-Type':
-              'application/json'
-          },
-
-          body: JSON.stringify({
-            status: 'success',
-
-            today: TODAY,
-
-            todayOnly:
-              TODAY_ONLY,
-
-            search,
-            city,
-
-            pagesScanned,
-
-            detailsChecked,
-
-            resultsCount:
-              results.length,
-
-            datasetId,
-
-            downloadUrl:
-              `https://api.apify.com/v2/datasets/${datasetId}/items?format=json`
-          })
-        }
-      );
-
-      log.info(
-        '✅ تم إرسال Webhook'
-      );
-    }
-  } catch (error) {
     log.warning(
-      `⚠️ فشل Webhook: ${error.message}`
+        '⚠️ لم يتم العثور على إعلانات.'
     );
-  }
+} else {
+    /*
+     * أولاً نحاول الاستفادة من التاريخ
+     * الموجود في بيانات صفحة البحث.
+     */
+    for (
+        const listing of allListings
+    ) {
+        if (
+            listing.postedDate
+        ) {
+            dateFound++;
+        }
+    }
+
+    /*
+     * في وضع اليوم فقط:
+     * نفحص تفاصيل الإعلانات التي
+     * لا نملك تاريخها.
+     *
+     * إذا كان لدينا تاريخ اليوم بالفعل
+     * لا نحتاج إلى فتح التفاصيل.
+     */
+    let candidates =
+        allListings.filter(
+            item => {
+                if (
+                    TODAY_ONLY &&
+                    item.postedDate
+                ) {
+                    return isToday(
+                        item.postedDate
+                    );
+                }
+
+                return true;
+            }
+        );
+
+    /*
+     * إذا لم يوجد تاريخ في القائمة،
+     * نفحص التفاصيل بالتوازي.
+     */
+    if (
+        FETCH_PHONE ||
+        TODAY_ONLY ||
+        candidates.length <
+            MAX_RESULTS
+    ) {
+        const needDetails =
+            allListings.filter(
+                item => {
+                    if (
+                        TODAY_ONLY &&
+                        item.postedDate &&
+                        !isToday(
+                            item.postedDate
+                        )
+                    ) {
+                        return false;
+                    }
+
+                    return true;
+                }
+            );
+
+        log.info(
+            `⚡ فحص ${needDetails.length} تفاصيل بتوازي ${CONCURRENCY}`
+        );
+
+        const details =
+            await mapConcurrent(
+                needDetails,
+                CONCURRENCY,
+                async listing => {
+                    detailsChecked++;
+
+                    return {
+                        listing,
+                        detail:
+                            await fetchDetail(
+                                listing
+                            )
+                    };
+                }
+            );
+
+        for (
+            const row of details
+        ) {
+            if (
+                !row.detail
+            ) {
+                continue;
+            }
+
+            const {
+                listing,
+                detail
+            } = row;
+
+            if (
+                detail.postedDate
+            ) {
+                dateFound++;
+
+                listing.postedDate =
+                    detail.postedDate;
+
+                listing.postedRaw =
+                    detail.postedRaw;
+            } else {
+                dateMissing++;
+            }
+
+            if (
+                detail.phone
+            ) {
+                listing.phone =
+                    detail.phone;
+            }
+
+            if (
+                detail.bedrooms
+            ) {
+                listing.bedrooms =
+                    detail.bedrooms;
+            }
+
+            if (
+                detail.bathrooms
+            ) {
+                listing.bathrooms =
+                    detail.bathrooms;
+            }
+
+            if (
+                detail.ownerName
+            ) {
+                listing.owner_name =
+                    detail.ownerName;
+            }
+
+            if (
+                detail.license
+            ) {
+                listing.rega_license =
+                    detail.license;
+            }
+
+            listing.is_verified =
+                detail.verified;
+        }
+
+        candidates =
+            allListings;
+    }
+
+    for (
+        const listing of candidates
+    ) {
+        if (
+            results.length >=
+            MAX_RESULTS
+        ) {
+            break;
+        }
+
+        if (
+            TODAY_ONLY
+        ) {
+            if (
+                !listing.postedDate
+            ) {
+                continue;
+            }
+
+            if (
+                !isToday(
+                    listing.postedDate
+                )
+            ) {
+                continue;
+            }
+        }
+
+        const item = {
+            _raw_id:
+                listing._raw_id,
+
+            name:
+                listing.name || '',
+
+            priceSar:
+                listing.priceSar || '',
+
+            listing_type:
+                listing.listing_type ||
+                'sale',
+
+            area_sqm:
+                listing.area_sqm || '',
+
+            city:
+                listing.city ||
+                city,
+
+            district:
+                listing.district ||
+                district,
+
+            property_type:
+                listing.name
+                    ?.split(/\s+/)[0] ||
+                '',
+
+            description:
+                listing.description ||
+                '',
+
+            phone:
+                listing.phone ||
+                '',
+
+            bedrooms:
+                listing.bedrooms ||
+                '',
+
+            bathrooms:
+                listing.bathrooms ||
+                '',
+
+            owner_name:
+                listing.owner_name ||
+                '',
+
+            rega_license:
+                listing.rega_license ||
+                '',
+
+            is_verified:
+                Boolean(
+                    listing.is_verified
+                ),
+
+            posted_at:
+                listing.postedDate
+                    ? formatDate(
+                        listing.postedDate
+                    )
+                    : '',
+
+            posted_at_iso:
+                listing.postedDate
+                    ? listing.postedDate
+                        .toISOString()
+                    : '',
+
+            date_raw:
+                listing.postedRaw ||
+                '',
+
+            url:
+                listing.url,
+
+            images:
+                listing.images ||
+                [],
+
+            has_image:
+                Boolean(
+                    listing.has_image
+                ),
+
+            source:
+                'aqar',
+
+            scanned_at:
+                new Date()
+                    .toISOString()
+        };
+
+        results.push(
+            item
+        );
+
+        await Actor.pushData(
+            item
+        );
+
+        log.info(
+            `✅ ${results.length}/${MAX_RESULTS} | ${item.name.slice(0, 45)} | ${item.posted_at}`
+        );
+    }
+}
+
+log.info(
+    '━━━━━━━━━━━━━━━━━━━━━━'
+);
+
+log.info(
+    `🎯 النتائج: ${results.length}`
+);
+
+log.info(
+    `📄 الصفحات: ${pagesScanned}`
+);
+
+log.info(
+    `🔎 التفاصيل: ${detailsChecked}`
+);
+
+log.info(
+    `📅 تواريخ مقروءة: ${dateFound}`
+);
+
+log.info(
+    `⚠️ بدون تاريخ: ${dateMissing}`
+);
+
+if (
+    results.length === 0 &&
+    TODAY_ONLY
+) {
+    log.warning(
+        `⚠️ لم يتم تأكيد أي إعلان بتاريخ ${TODAY}.`
+    );
+
+    log.warning(
+        'هذا يعني أن النظام لم يجد إعلاناً استطاع تأكيد أنه من اليوم، وليس مجرد تخمين.'
+    );
+}
+
+if (
+    webhookUrl &&
+    webhookUrl.trim()
+) {
+    try {
+        const datasetId =
+            process.env
+                .APIFY_DEFAULT_DATASET_ID;
+
+        await fetch(
+            webhookUrl.trim(),
+            {
+                method: 'POST',
+
+                headers: {
+                    'Content-Type':
+                        'application/json'
+                },
+
+                body:
+                    JSON.stringify({
+                        status:
+                            'success',
+
+                        today:
+                            TODAY,
+
+                        todayOnly:
+                            TODAY_ONLY,
+
+                        search,
+                        city,
+
+                        pagesScanned,
+
+                        detailsChecked,
+
+                        resultsCount:
+                            results.length,
+
+                        datasetId,
+
+                        downloadUrl:
+                            `https://api.apify.com/v2/datasets/${datasetId}/items?format=json`
+                    })
+            }
+        );
+
+        log.info(
+            '✅ Webhook تم إرساله'
+        );
+
+    } catch (error) {
+        log.warning(
+            `⚠️ Webhook: ${error.message}`
+        );
+    }
 }
 
 await Actor.exit();
