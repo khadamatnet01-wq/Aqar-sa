@@ -1,665 +1,899 @@
-// -*- coding: utf-8 -*-
-// أكتور Apify لاستخراج إعلانات عقار (sa.aqar.fm)
-// وضع "اليوم فقط": يتوقف تلقائياً بمجرد الوصول لأول إعلان أقدم من اليوم،
-// لأن الموقع يرتب النتائج بالأحدث أولاً — فلا داعي لمتابعة الزحف بعد ذلك.
-
 import { Actor } from 'apify';
 import { PlaywrightCrawler, log } from 'crawlee';
 
 await Actor.init();
 
-const input = (await Actor.getInput()) || {};
+const input = await Actor.getInput() || {};
 const {
-    startUrl = '',
-    search = 'شقق-للبيع',
-    city = 'الرياض',
-    subArea = '',
-    district = '',
-    maxResults = 20,
-    fetchPhoneFromDetail = true,
-    todayOnly = false,          // ⭐ جلب إعلانات اليوم فقط
-    maxPagesToScan = 30,        // حد أقصى لعدد الصفحات في وضع "اليوم فقط" (فحص شامل بلا توقف مبكر)
-    proxyConfiguration: proxyInput,
-    webhookUrl = '',
+  startUrl = '',
+  search = 'شقق-للبيع',
+  city = 'الرياض',
+  subArea = '',
+  district = '',
+  maxResults = 20,
+  fetchPhoneFromDetail = true,
+  todayOnly = false,
+  maxPagesToScan = 30,
+  proxyConfiguration: proxyInput,
+  webhookUrl = '',
 } = input;
 
-// 🔍 تشخيص: يطبع القيمة الفعلية المُستلمة من Apify لهذا الحقل تحديداً،
-// لكشف ما إذا كان الخيار وصل فعلاً كـ true أو أنه لم يُستلم أصلاً (undefined/false)
-log.info(`🔍 تشخيص المدخلات: todayOnly المُستلم = ${JSON.stringify(input.todayOnly)} (النوع: ${typeof input.todayOnly}) — القيمة الفعلية المستخدمة = ${todayOnly}`);
-log.info(`🔍 تشخيص روابط: startUrl="${input.startUrl || '(فارغ)'}" | search="${input.search || '(فارغ)'}" | city="${input.city || '(فارغ)'}" | subArea="${input.subArea || '(فارغ)'}" | district="${input.district || '(فارغ)'}"`);
+const MAX_RESULTS = Math.max(1, Number(maxResults) || 20);
+const MAX_PAGES = Math.max(1, Number(maxPagesToScan) || 30);
+const TODAY_ONLY = todayOnly === true || todayOnly === 'true';
+const FETCH_PHONE = fetchPhoneFromDetail === true || fetchPhoneFromDetail === 'true';
 
 const proxyConfiguration = await Actor.createProxyConfiguration(
-    proxyInput || { useApifyProxy: true, groups: ['RESIDENTIAL'] },
+  proxyInput || { useApifyProxy: true, groups: ['RESIDENTIAL'] }
 );
 
-const finalItems = [];
-const seenIds = new Set();
+const items = [];
+const seen = new Set();
+let pagesScanned = 0;
+let skippedNoDate = 0;
 
-// تاريخ اليوم بتوقيت الرياض بصيغة YYYY-MM-DD للمقارنة
-function getTodayRiyadh() {
-    const now = new Date();
-    const riyadhStr = now.toLocaleString('en-US', { timeZone: 'Asia/Riyadh' });
-    const riyadhDate = new Date(riyadhStr);
-    const y = riyadhDate.getFullYear();
-    const m = String(riyadhDate.getMonth() + 1).padStart(2, '0');
-    const d = String(riyadhDate.getDate()).padStart(2, '0');
-    return `${y}-${m}-${d}`;
-}
-const TODAY_RIYADH = getTodayRiyadh();
+const digits = s => String(s || '')
+  .replace(/[٠-٩]/g, x => '٠١٢٣٤٥٦٧٨٩'.indexOf(x))
+  .replace(/[۰-۹]/g, x => '۰۱۲۳۴۵۶۷۸۹'.indexOf(x));
 
-// مقارنة تاريخ ISO مع تاريخ اليوم (بتوقيت الرياض)
-function isFromToday(isoDate) {
-    if (!isoDate) return false;
-    const d = new Date(isoDate);
-    if (isNaN(d.getTime())) return false;
-    const dateStr = d.toLocaleString('en-US', { timeZone: 'Asia/Riyadh' });
-    const dd = new Date(dateStr);
-    const y = dd.getFullYear();
-    const m = String(dd.getMonth() + 1).padStart(2, '0');
-    const day = String(dd.getDate()).padStart(2, '0');
-    return `${y}-${m}-${day}` === TODAY_RIYADH;
-}
+const normalize = s => String(s || '')
+  .trim()
+  .replace(/\s+/g, '-')
+  .replace(/^-+|-+$/g, '');
 
-// هل التاريخ أقدم من اليوم؟ (وليس اليوم نفسه ولا في المستقبل)
-function isOlderThanToday(isoDate) {
-    if (!isoDate) return false;
-    const d = new Date(isoDate);
-    if (isNaN(d.getTime())) return false;
-    const dateStr = d.toLocaleString('en-US', { timeZone: 'Asia/Riyadh' });
-    const dd = new Date(dateStr);
-    const y = dd.getFullYear();
-    const m = String(dd.getMonth() + 1).padStart(2, '0');
-    const day = String(dd.getDate()).padStart(2, '0');
-    return `${y}-${m}-${day}` < TODAY_RIYADH;
+function listUrl(page = 1) {
+  if (startUrl?.trim()) {
+    return page === 1
+      ? startUrl.trim()
+      : `${startUrl.trim().replace(/\/+$/, '')}/${page}`;
+  }
+
+  const parts = [search, city, subArea, district]
+    .map(normalize)
+    .filter(Boolean);
+
+  const base = `https://sa.aqar.fm/${parts.map(encodeURI).join('/')}`;
+
+  return page === 1 ? base : `${base}/${page}`;
 }
 
-function normalizeSegment(text) {
-    if (!text) return '';
-    return text.trim().replace(/\s+/g, '-').replace(/^-+|-+$/g, '');
+function riyadhDate(date = new Date()) {
+  const p = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Riyadh',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit'
+  }).formatToParts(date);
+
+  const x = Object.fromEntries(p.map(v => [v.type, v.value]));
+
+  return `${x.year}-${x.month}-${x.day}`;
 }
 
-function buildListUrl() {
-    if (startUrl && startUrl.trim()) return startUrl.trim();
+const TODAY = riyadhDate();
 
-    const parts = [normalizeSegment(search), normalizeSegment(city)];
-    const normSubArea = normalizeSegment(subArea);
-    const normDistrict = normalizeSegment(district);
-    if (normSubArea) parts.push(normSubArea);
-    if (normDistrict) parts.push(normDistrict);
+function isToday(value) {
+  const d = new Date(value);
 
-    const path = parts.filter(Boolean).map(p => encodeURI(p)).join('/');
-    return `https://sa.aqar.fm/${path}`;
+  return !Number.isNaN(d.getTime()) &&
+    riyadhDate(d) === TODAY;
 }
 
-const extractPhone = (text) => {
-    if (!text) return '';
-    const match = text.match(/(?:\+?966|0)5[0-9]{8}/);
-    if (!match) return '';
-    let phone = match[0].replace(/\s|-/g, '');
-    if (phone.startsWith('+9665')) phone = '0' + phone.slice(4);
-    if (phone.startsWith('9665'))  phone = '0' + phone.slice(3);
-    if (phone.startsWith('5'))     phone = '0' + phone;
-    return phone;
-};
+function phone(text) {
+  const s = digits(text).replace(/[\s\-().]/g, '');
+  const m = s.match(/(?:\+?966|0)?5\d{8}/);
 
-// استخراج بطاقات صفحة القائمة (بدون تفاصيل الجوال/التاريخ الدقيق)
-async function extractListCards(page) {
-    return await page.evaluate(() => {
-        const results = [];
-        const seen = new Set();
+  if (!m) return '';
 
-        const links = Array.from(document.querySelectorAll('a[href]'))
-            .filter(a => a.href.match(/-\d{5,}$/) && a.href.includes('sa.aqar.fm'));
+  let p = m[0];
 
-        for (const link of links) {
-            const href = link.href;
-            const idMatch = href.match(/-(\d{5,})$/);
-            if (!idMatch) continue;
-            const id = idMatch[1];
-            if (seen.has(id)) continue;
-            seen.add(id);
+  if (p.startsWith('+9665')) {
+    p = '0' + p.slice(4);
+  } else if (p.startsWith('9665')) {
+    p = '0' + p.slice(3);
+  } else if (p.startsWith('5')) {
+    p = '0' + p;
+  }
 
-            const fullText = link.innerText || '';
-            const lines = fullText.split('\n').map(l => l.trim()).filter(Boolean);
-            const title = lines[0] || '';
-
-            // ⭐ تجاهل الإعلانات "المميزة" تماماً — ترتيبها مدفوع وليس زمنياً، فتضليل فلترة التاريخ
-            const isFeatured = /^مميز/.test(fullText.trim());
-            if (isFeatured) continue;
-
-            const priceMatch = fullText.match(/([\d,]+(?:\.\d+)?)\s*§/);
-            const price = priceMatch ? priceMatch[1].replace(/,/g, '') : '';
-            const isRent = /سنوي/.test(fullText);
-
-            const areaMatch = fullText.match(/([\d,]+)\s*م²/);
-            const area = areaMatch ? areaMatch[1].replace(/,/g, '') : '';
-
-            const districtMatch = title.match(/حي\s+([^\,،]+)/);
-            const cityMatch = title.match(/مدينة\s+([^\,،]+)/);
-            const districtName = districtMatch ? districtMatch[1].trim() : '';
-            const cityName = cityMatch ? cityMatch[1].trim() : '';
-
-            const propTypeMatch = title.match(/^([\u0600-\u06FF]+)\s+(?:للبيع|للإيجار)/);
-            const propertyType = propTypeMatch ? propTypeMatch[1].trim() : '';
-
-            const description = lines.slice(1).join(' ').trim();
-
-            const phoneMatch = fullText.match(/(?:\+?966|0)5[0-9]{8}/);
-            let phone = '';
-            if (phoneMatch) {
-                phone = phoneMatch[0].replace(/\s|-/g, '');
-                if (phone.startsWith('+9665')) phone = '0' + phone.slice(4);
-                if (phone.startsWith('9665'))  phone = '0' + phone.slice(3);
-                if (phone.startsWith('5'))     phone = '0' + phone;
-            }
-
-            const imgEl = link.querySelector('img');
-            const imgSrc = imgEl?.src || imgEl?.getAttribute('data-src') || '';
-
-            results.push({
-                _raw_id: id,
-                name: title,
-                priceSar: price,
-                listing_type: isRent ? 'rent' : 'sale',
-                area_sqm: area,
-                district: districtName,
-                city: cityName,
-                property_type: propertyType,
-                description,
-                phone,
-                has_image: !!imgSrc,
-                images: imgSrc ? [imgSrc] : [],
-                url: href,
-            });
-        }
-        return results;
-    });
+  return /^05\d{8}$/.test(p) ? p : '';
 }
 
-// فتح صفحة تفاصيل إعلان واحد وجلب الجوال + تاريخ النشر
-// تحويل نص عربي نسبي مثل "منذ 9 ساعات تقريباً" أو "منذ 3 أيام" إلى تاريخ فعلي
-function parseArabicRelativeDate(text) {
-    if (!text) return null;
-    const now = new Date();
-    const cleaned = text.replace(/تقريباً|تقريبا|تقريب/g, '').trim();
+function explicitDate(text) {
+  const s = digits(text).trim();
 
-    if (/اليوم|الآن|منذ لحظات|منذ قليل/.test(cleaned)) {
-        return now;
-    }
-    if (/أمس/.test(cleaned)) {
-        const d = new Date(now);
-        d.setDate(d.getDate() - 1);
-        return d;
-    }
+  const valid = (y, m, d) => {
+    const x = new Date(Date.UTC(y, m - 1, d));
 
-    // JS regex \b لا يعمل بشكل صحيح مع الحروف العربية، لذا نستخدم negative lookahead يدوياً كحد للكلمة
-    const NB = '(?![\\u0621-\\u064A])';
+    return (
+      y >= 2000 &&
+      y <= 2100 &&
+      x.getUTCFullYear() === y &&
+      x.getUTCMonth() === m - 1 &&
+      x.getUTCDate() === d
+    );
+  };
 
-    const applyDelta = (unit, amount) => {
-        const d = new Date(now);
-        if (unit === 'second') d.setSeconds(d.getSeconds() - amount);
-        else if (unit === 'minute') d.setMinutes(d.getMinutes() - amount);
-        else if (unit === 'hour') d.setHours(d.getHours() - amount);
-        else if (unit === 'day') d.setDate(d.getDate() - amount);
-        else if (unit === 'week') d.setDate(d.getDate() - amount * 7);
-        else if (unit === 'month') d.setMonth(d.getMonth() - amount);
-        else if (unit === 'year') d.setFullYear(d.getFullYear() - amount);
-        return d;
-    };
+  let m = s.match(
+    /(?:^|\D)(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})(?:\D|$)/
+  );
 
-    // أولاً: صيغة "منذ X وحدة" حيث X رقم صريح أو كلمة عدد (3 فأكثر عادة) — لها الأولوية لأنها أكثر تحديداً
-    const numberWords = {
-        'ثلاثة': 3, 'ثلاث': 3, 'أربعة': 4, 'أربع': 4, 'خمسة': 5, 'خمس': 5,
-        'ستة': 6, 'ست': 6, 'سبعة': 7, 'سبع': 7, 'ثمانية': 8, 'ثمان': 8,
-        'تسعة': 9, 'تسع': 9, 'عشرة': 10, 'عشر': 10,
-    };
-    const numMatch = cleaned.match(/منذ\s+([\u0621-\u064A0-9]+)\s+(ثانية|ثواني|دقيقة|دقائق|ساعة|ساعات|يوم|أيام|أسبوع|أسابيع|شهر|أشهر|سنة|سنوات)/);
-    if (numMatch) {
-        let amount = parseInt(numMatch[1], 10);
-        if (isNaN(amount)) amount = numberWords[numMatch[1]] ?? null;
-        if (amount !== null) {
-            const unitRaw = numMatch[2];
-            let unit = null;
-            if (/ثانية|ثواني/.test(unitRaw)) unit = 'second';
-            else if (/دقيقة|دقائق/.test(unitRaw)) unit = 'minute';
-            else if (/ساعة|ساعات/.test(unitRaw)) unit = 'hour';
-            else if (/يوم|أيام/.test(unitRaw)) unit = 'day';
-            else if (/أسبوع|أسابيع/.test(unitRaw)) unit = 'week';
-            else if (/شهر|أشهر/.test(unitRaw)) unit = 'month';
-            else if (/سنة|سنوات/.test(unitRaw)) unit = 'year';
-            if (unit) return applyDelta(unit, amount);
-        }
-    }
+  if (m) {
+    const d = +m[1];
+    const mo = +m[2];
+    const y = +m[3];
 
-    // ثانياً: الصيغ المفردة/المثناة بدون رقم منفصل ("منذ ساعة"، "منذ يومين"، "منذ أسبوع"...)
-    const bareUnitWords = [
-        { re: new RegExp(`منذ\\s+ثانيتين${NB}`), amount: 2, unit: 'second' },
-        { re: new RegExp(`منذ\\s+ثانية${NB}`), amount: 1, unit: 'second' },
-        { re: new RegExp(`منذ\\s+دقيقتين${NB}`), amount: 2, unit: 'minute' },
-        { re: new RegExp(`منذ\\s+دقيقة${NB}`), amount: 1, unit: 'minute' },
-        { re: new RegExp(`منذ\\s+ساعتين${NB}`), amount: 2, unit: 'hour' },
-        { re: new RegExp(`منذ\\s+ساعة${NB}`), amount: 1, unit: 'hour' },
-        { re: new RegExp(`منذ\\s+يومين${NB}`), amount: 2, unit: 'day' },
-        { re: new RegExp(`منذ\\s+يوم${NB}`), amount: 1, unit: 'day' },
-        { re: new RegExp(`منذ\\s+أسبوعين${NB}`), amount: 2, unit: 'week' },
-        { re: new RegExp(`منذ\\s+أسبوع${NB}`), amount: 1, unit: 'week' },
-        { re: new RegExp(`منذ\\s+شهرين${NB}`), amount: 2, unit: 'month' },
-        { re: new RegExp(`منذ\\s+شهر${NB}`), amount: 1, unit: 'month' },
-        { re: new RegExp(`منذ\\s+سنتين${NB}`), amount: 2, unit: 'year' },
-        { re: new RegExp(`منذ\\s+سنة${NB}`), amount: 1, unit: 'year' },
-    ];
-    for (const { re, amount, unit } of bareUnitWords) {
-        if (re.test(cleaned)) return applyDelta(unit, amount);
-    }
+    if (!valid(y, mo, d)) return null;
 
+    return new Date(
+      `${y}-${String(mo).padStart(2, '0')}-${String(d).padStart(2, '0')}T12:00:00+03:00`
+    );
+  }
+
+  m = s.match(
+    /(?:^|\D)(\d{4})[\/\-.](\d{1,2})[\/\-.](\d{1,2})(?:\D|$)/
+  );
+
+  if (m) {
+    const y = +m[1];
+    const mo = +m[2];
+    const d = +m[3];
+
+    if (!valid(y, mo, d)) return null;
+
+    return new Date(
+      `${y}-${String(mo).padStart(2, '0')}-${String(d).padStart(2, '0')}T12:00:00+03:00`
+    );
+  }
+
+  return null;
+}
+
+function relativeDate(text) {
+  const s = digits(text)
+    .replace(/تقريباً|تقريبا|تقريب/g, '')
+    .trim();
+
+  const now = new Date();
+
+  if (/اليوم|الآن|منذ لحظات|منذ قليل/.test(s)) {
+    return now;
+  }
+
+  if (/أمس/.test(s)) {
+    now.setDate(now.getDate() - 1);
+    return now;
+  }
+
+  const nums = {
+    ثلاثة: 3,
+    ثلاث: 3,
+    أربعة: 4,
+    أربع: 4,
+    خمسة: 5,
+    خمس: 5,
+    ستة: 6,
+    ست: 6,
+    سبعة: 7,
+    سبع: 7,
+    ثمانية: 8,
+    ثمان: 8,
+    تسعة: 9,
+    تسع: 9,
+    عشرة: 10,
+    عشر: 10
+  };
+
+  const m = s.match(
+    /منذ\s+([\u0621-\u064A0-9]+)\s+(ثانية|ثواني|دقيقة|دقائق|ساعة|ساعات|يوم|أيام|أسبوع|أسابيع|شهر|أشهر|سنة|سنوات)/
+  );
+
+  const bare = {
+    ثانية: 1,
+    دقيقتان: 2,
+    دقيقتين: 2,
+    دقيقة: 1,
+    ساعتان: 2,
+    ساعتين: 2,
+    ساعة: 1,
+    يومان: 2,
+    يومين: 2,
+    يوم: 1,
+    أسبوعان: 2,
+    أسبوعين: 2,
+    أسبوع: 1,
+    شهران: 2,
+    شهرين: 2,
+    شهر: 1,
+    سنتان: 2,
+    سنتين: 2,
+    سنة: 1
+  };
+
+  const unit = s.match(
+    /منذ\s+(ثانيتين|ثانية|دقيقتين|دقيقة|ساعتين|ساعة|يومين|يوم|أسبوعين|أسبوع|شهرين|شهر|سنتين|سنة)/
+  );
+
+  let n;
+  let u;
+
+  if (m) {
+    n = Number(m[1]) || nums[m[1]];
+    u = m[2];
+  } else if (unit) {
+    n = bare[unit[1]];
+    u = unit[1];
+  } else {
     return null;
+  }
+
+  const d = new Date(now);
+
+  if (/ثانية/.test(u)) {
+    d.setSeconds(d.getSeconds() - n);
+  } else if (/دقيقة/.test(u)) {
+    d.setMinutes(d.getMinutes() - n);
+  } else if (/ساعة/.test(u)) {
+    d.setHours(d.getHours() - n);
+  } else if (/يوم/.test(u)) {
+    d.setDate(d.getDate() - n);
+  } else if (/أسبوع/.test(u)) {
+    d.setDate(d.getDate() - n * 7);
+  } else if (/شهر/.test(u)) {
+    d.setMonth(d.getMonth() - n);
+  } else if (/سنة/.test(u)) {
+    d.setFullYear(d.getFullYear() - n);
+  }
+
+  return d;
 }
 
-// تحليل تاريخ صريح بصيغة DD/MM/YYYY (أو YYYY-MM-DD) دون الاعتماد على new Date()
-// لأنه يفسّر "12/05/2026" بالنمط الأمريكي (MM/DD) فيقلب اليوم والشهر
-function parseExplicitDate(text) {
-    if (!text) return null;
-    const normalized = text
-        .replace(/[٠-٩]/g, d => '٠١٢٣٤٥٦٧٨٩'.indexOf(d))
-        .replace(/[۰-۹]/g, d => '۰۱۲۳۴۵۶۷۸۹'.indexOf(d))
-        .trim();
-    const pad = (n) => String(n).padStart(2, '0');
-    const valid = (y, mo, d) => mo >= 1 && mo <= 12 && d >= 1 && d <= 31 && y >= 2000 && y <= 2100;
-
-    let m = normalized.match(/(?:^|\D)(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})(?:\D|$)/);
-    if (m) {
-        const d = parseInt(m[1], 10), mo = parseInt(m[2], 10), y = parseInt(m[3], 10);
-        if (valid(y, mo, d)) return new Date(`${y}-${pad(mo)}-${pad(d)}T12:00:00+03:00`); // منتصف النهار بتوقيت الرياض
-        return null;
-    }
-    m = normalized.match(/(?:^|\D)(\d{4})[\/\-.](\d{1,2})[\/\-.](\d{1,2})(?:\D|$)/);
-    if (m) {
-        const y = parseInt(m[1], 10), mo = parseInt(m[2], 10), d = parseInt(m[3], 10);
-        if (valid(y, mo, d)) return new Date(`${y}-${pad(mo)}-${pad(d)}T12:00:00+03:00`);
-    }
-    return null;
-}
-
-// عرض ميلادي (يطابق ما يظهر في الموقع) بتوقيت الرياض
-function formatPostedAt(date, withTime) {
-    const opts = { timeZone: 'Asia/Riyadh', year: 'numeric', month: '2-digit', day: '2-digit' };
-    if (withTime) { opts.hour = '2-digit'; opts.minute = '2-digit'; opts.hour12 = false; }
-    return date.toLocaleString('en-GB', opts);
-}
-
-async function fetchDetail(page, url, reqLog) {
-    await page.route('**/*', (route) => {
-        const type = route.request().resourceType();
-        if (['image', 'media', 'font'].includes(type)) {
-            route.abort();
-        } else {
-            route.continue();
+function formatDate(d, time = true) {
+  return d.toLocaleString('en-GB', {
+    timeZone: 'Asia/Riyadh',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    ...(time
+      ? {
+          hour: '2-digit',
+          minute: '2-digit',
+          hour12: false
         }
+      : {})
+  });
+}
+
+async function extractCards(page) {
+  return page.evaluate(() => {
+    const out = [];
+    const seen = new Set();
+
+    for (const a of document.querySelectorAll('a[href]')) {
+      const href = a.href;
+      const m = href.match(/-(\d{5,})\/?(?:[?#].*)?$/);
+
+      if (!m || !href.includes('aqar.fm')) continue;
+
+      const id = m[1];
+
+      if (seen.has(id)) continue;
+
+      seen.add(id);
+
+      const text = a.innerText || '';
+
+      if (/^مميز/.test(text.trim())) continue;
+
+      const lines = text
+        .split('\n')
+        .map(x => x.trim())
+        .filter(Boolean);
+
+      const title = lines[0] || '';
+
+      const price = (
+        text.match(
+          /([\d,]+(?:\.\d+)?)\s*(?:§|ر\.س|ريال|﷼)/
+        )?.[1] || ''
+      ).replace(/,/g, '');
+
+      const area = (
+        text.match(/([\d,]+)\s*م²/)?.[1] || ''
+      ).replace(/,/g, '');
+
+      const p = text.match(
+        /(?:\+?966|0)5[0-9]{8}/
+      );
+
+      const img =
+        a.querySelector('img')?.src ||
+        a.querySelector('img')?.getAttribute('data-src') ||
+        '';
+
+      out.push({
+        _raw_id: id,
+        name: title,
+        priceSar: price,
+        listing_type: /سنوي/.test(text)
+          ? 'rent'
+          : 'sale',
+        area_sqm: area,
+
+        district:
+          title.match(/حي\s+([^\,،]+)/)?.[1]?.trim() ||
+          '',
+
+        city:
+          title.match(/مدينة\s+([^\,،]+)/)?.[1] ||
+          '',
+
+        property_type:
+          title.match(
+            /^([\u0600-\u06FF]+)\s+(?:للبيع|للإيجار)/
+          )?.[1] || '',
+
+        description:
+          lines.slice(1).join(' ').trim(),
+
+        phone: p ? p[0] : '',
+
+        has_image: !!img,
+
+        images: img ? [img] : [],
+
+        url: href
+      });
+    }
+
+    return out;
+  });
+}
+
+async function detail(page, url, reqLog) {
+  await page.route('**/*', route =>
+    ['image', 'media', 'font'].includes(
+      route.request().resourceType()
+    )
+      ? route.abort()
+      : route.continue()
+  );
+
+  await page.goto(url, {
+    waitUntil: 'domcontentloaded',
+    timeout: 60000
+  });
+
+  await page.waitForTimeout(800);
+
+  if (FETCH_PHONE) {
+    const btn = await page.$(
+      'button:has-text("اتصال"),a:has-text("اتصال"),[class*="call"],[class*="phone"]'
+    );
+
+    if (btn) {
+      await btn
+        .click({ timeout: 3000 })
+        .catch(() => {});
+    }
+  }
+
+  let ph = FETCH_PHONE
+    ? phone(
+        await page.evaluate(
+          () => document.body.innerText || ''
+        )
+      )
+    : '';
+
+  if (FETCH_PHONE && !ph) {
+    const href = await page
+      .$eval(
+        'a[href^="tel:"]',
+        e => e.href
+      )
+      .catch(() => '');
+
+    if (href) {
+      ph = phone(
+        href.replace(/^tel:/i, '')
+      );
+    }
+  }
+
+  let posted = '';
+  let iso = '';
+  let raw = '';
+  let bedrooms = '';
+  let bathrooms = '';
+  let owner = '';
+  let verified = false;
+  let license = '';
+
+  const next = await page
+    .$eval(
+      '#__NEXT_DATA__',
+      e => e.textContent
+    )
+    .catch(() => null);
+
+  if (next) {
+    try {
+      const data = JSON.parse(next);
+      let prop;
+
+      const find = (o, depth = 0) => {
+        if (
+          prop ||
+          !o ||
+          typeof o !== 'object' ||
+          depth > 12
+        ) {
+          return;
+        }
+
+        if (
+          (o.id ||
+            o.property_id ||
+            o.ad_id) &&
+          (o.createdAt ||
+            o.created_at ||
+            o.published_at) &&
+          (o.title ||
+            o.price ||
+            o.rooms ||
+            o.bedrooms)
+        ) {
+          prop = o;
+          return;
+        }
+
+        for (const v of Object.values(o)) {
+          find(v, depth + 1);
+
+          if (prop) return;
+        }
+      };
+
+      find(data);
+
+      if (prop) {
+        owner =
+          prop.advertiser_name ||
+          prop.owner_name ||
+          prop.user?.name ||
+          '';
+
+        verified = !!(
+          prop.is_verified ||
+          prop.verified
+        );
+
+        license =
+          prop.fal_license ||
+          prop.rega_license ||
+          '';
+
+        bedrooms = String(
+          prop.rooms ??
+          prop.bedrooms ??
+          ''
+        );
+
+        bathrooms = String(
+          prop.bathrooms ?? ''
+        );
+
+        if (FETCH_PHONE && !ph) {
+          ph = phone(
+            prop.phone ||
+            prop.mobile ||
+            prop.contact_phone ||
+            ''
+          );
+        }
+
+        raw =
+          prop.created_at ||
+          prop.createdAt ||
+          prop.published_at ||
+          '';
+
+        const d =
+          raw &&
+          new Date(raw);
+
+        if (
+          d &&
+          !Number.isNaN(d.getTime())
+        ) {
+          iso = d.toISOString();
+
+          posted =
+            d.toLocaleString(
+              'ar-SA',
+              {
+                timeZone: 'Asia/Riyadh',
+                year: 'numeric',
+                month: '2-digit',
+                day: '2-digit',
+                hour: '2-digit',
+                minute: '2-digit'
+              }
+            );
+        }
+      }
+    } catch (e) {
+      reqLog.warning(
+        `NEXT_DATA: ${e.message}`
+      );
+    }
+  }
+
+  if (!posted) {
+    const found = await page.evaluate(() => {
+      const label = 'تاريخ الإضافة';
+
+      const re =
+        /(\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{4}|\d{4}[\/\-.]\d{1,2}[\/\-.]\d{1,2}|منذ\s+[^\n]{1,30})/;
+
+      for (
+        const el of document.querySelectorAll('*')
+      ) {
+        if (
+          el.children.length ||
+          (el.textContent || '').trim() !== label
+        ) {
+          continue;
+        }
+
+        let n = el;
+
+        for (
+          let i = 0;
+          i < 5 && n;
+          i++, n = n.parentElement
+        ) {
+          const t = n.innerText || '';
+          const i1 = t.indexOf(label);
+
+          if (i1 < 0) continue;
+
+          const m = t
+            .slice(i1 + label.length)
+            .match(re);
+
+          if (m) return m[0].trim();
+        }
+      }
+
+      return '';
     });
 
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await page.waitForTimeout(1200);
+    if (found) {
+      raw = found;
 
-    if (fetchPhoneFromDetail) {
-        try {
-            const callBtn = await page.$('button:has-text("اتصال"), a:has-text("اتصال"), [class*="call"], [class*="phone"]');
-            if (callBtn) {
-                await callBtn.click({ timeout: 3000 }).catch(() => {});
-                await page.waitForTimeout(1200);
-            }
-        } catch { /* تجاهل */ }
+      const d =
+        explicitDate(found) ||
+        relativeDate(found);
+
+      if (d) {
+        iso = d.toISOString();
+
+        posted = formatDate(
+          d,
+          !explicitDate(found)
+        );
+      }
     }
+  }
 
-    const pageText = await page.evaluate(() => document.body.innerText || '');
-    let phone = fetchPhoneFromDetail ? extractPhone(pageText) : '';
-
-    if (fetchPhoneFromDetail && !phone) {
-        const telHref = await page.evaluate(() => {
-            const el = document.querySelector('a[href^="tel:"]');
-            return el ? el.href : '';
-        });
-        if (telHref) phone = telHref.replace('tel:', '').trim();
-    }
-
-    const nextDataText = await page.evaluate(() => {
-        const el = document.querySelector('#__NEXT_DATA__');
-        return el ? el.textContent : null;
-    });
-
-    let posted_at = '';
-    let posted_at_iso = '';
-    let date_raw = '';
-    let bedrooms = '';
-    let bathrooms = '';
-    let owner_name = '';
-    let is_verified = false;
-    let rega_license = '';
-
-    if (nextDataText) {
-        try {
-            const data = JSON.parse(nextDataText);
-            let propObj = null;
-            const findProp = (obj, depth = 0) => {
-                if (depth > 15 || propObj || !obj || typeof obj !== 'object') return;
-                if ((obj.title || obj.name) && (obj.price || obj.createdAt || obj.created_at)) {
-                    propObj = obj;
-                    return;
-                }
-                for (const val of Object.values(obj)) findProp(val, depth + 1);
-            };
-            findProp(data);
-
-            if (propObj) {
-                owner_name   = propObj.advertiser_name || propObj.owner_name || propObj.user?.name || '';
-                is_verified  = !!(propObj.is_verified || propObj.verified);
-                rega_license = propObj.fal_license || propObj.rega_license || rega_license;
-                bedrooms     = String(propObj.rooms || propObj.bedrooms || '');
-                bathrooms    = String(propObj.bathrooms || '');
-
-                if (fetchPhoneFromDetail) {
-                    const nextPhone = propObj.phone || propObj.mobile || propObj.contact_phone || '';
-                    if (nextPhone && !phone) phone = extractPhone(String(nextPhone)) || String(nextPhone);
-                }
-
-                const rawDate = propObj.created_at || propObj.createdAt || propObj.published_at || '';
-                if (rawDate) {
-                    const d = new Date(rawDate);
-                    if (!isNaN(d.getTime())) {
-                        posted_at_iso = d.toISOString();
-                        posted_at = d.toLocaleString('ar-SA', {
-                            timeZone: 'Asia/Riyadh',
-                            year: 'numeric', month: '2-digit', day: '2-digit',
-                            hour: '2-digit', minute: '2-digit',
-                        });
-                    }
-                }
-            }
-        } catch (e) {
-            reqLog.warning(`فشل تحليل __NEXT_DATA__: ${e.message}`);
-        }
-    }
-
-    if (!posted_at) {
-        // نقرأ القيمة المرتبطة بتسمية "تاريخ الإضافة" تحديداً، وليس أي نص "منذ ..." في الصفحة
-        // (قد يكون وقت تحديث الإعلان أو بطاقة إعلان مشابه). لا يوجد fallback عام عمداً لتفادي قبول تاريخ خاطئ.
-        const found = await page.evaluate(() => {
-            const LABEL = 'تاريخ الإضافة';
-            const toLatin = (s) => s
-                .replace(/[٠-٩]/g, d => '٠١٢٣٤٥٦٧٨٩'.indexOf(d))
-                .replace(/[۰-۹]/g, d => '۰۱۲۳۴۵۶۷۸۹'.indexOf(d));
-            const valueRe = /(\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{4}|\d{4}[\/\-.]\d{1,2}[\/\-.]\d{1,2}|منذ\s+[^\n]{1,30})/;
-            const labels = Array.from(document.querySelectorAll('*'))
-                .filter(el => el.children.length === 0 && (el.textContent || '').trim() === LABEL);
-            for (const label of labels) {
-                let node = label;
-                for (let depth = 0; depth < 5 && node; depth++, node = node.parentElement) {
-                    const text = toLatin(node.innerText || '');
-                    const idx = text.indexOf(LABEL);
-                    if (idx === -1) continue;
-                    const m = text.slice(idx + LABEL.length).match(valueRe);
-                    if (m) return m[0].trim(); // أقرب قيمة تأتي بعد التسمية
-                }
-            }
-            return '';
-        });
-
-        if (found) {
-            date_raw = found;
-            const explicit = parseExplicitDate(found);
-            const parsed = explicit || parseArabicRelativeDate(found);
-            if (parsed) {
-                posted_at_iso = parsed.toISOString();
-                posted_at = formatPostedAt(parsed, !explicit);
-            }
-        }
-    }
-
-    return { phone, posted_at, posted_at_iso, date_raw, bedrooms, bathrooms, owner_name, is_verified, rega_license };
+  return {
+    phone: ph,
+    posted_at: posted,
+    posted_at_iso: iso,
+    date_raw: raw,
+    bedrooms,
+    bathrooms,
+    owner_name: owner,
+    is_verified: verified,
+    rega_license: license
+  };
 }
-
-let pagesScannedToday = 0; // عداد الصفحات التي فُحصت فعلياً في وضع اليوم
-let skippedNoDate = 0;    // إعلانات لم نستطع قراءة تاريخ إضافتها فتُرفض بدل التخمين
 
 const crawler = new PlaywrightCrawler({
-    proxyConfiguration,
-    maxConcurrency: 1, // تسلسلي لتفادي إثقال الموقع أثناء فتح عشرات صفحات التفاصيل
-    // في وضع "اليوم فقط" لا يوجد توقف مبكر موثوق (الترتيب غير زمني بالكامل بسبب الإعلانات المميزة)،
-    // لذا نفحص عدداً أكبر من الصفحات بحثاً شاملاً بدل الاكتفاء بأول صفحة
-    maxRequestsPerCrawl: todayOnly ? (maxPagesToScan * 30 + 50) : maxResults + 60,
-    requestHandlerTimeoutSecs: 240,
-    navigationTimeoutSecs: 60,
+  proxyConfiguration,
 
-    async requestHandler({ page, request, log: reqLog }) {
+  maxConcurrency: 1,
 
-        // ==========================================
-        // مسار 1: صفحة القائمة
-        // ==========================================
-    if (request.userData.label === 'LIST') {
+  maxRequestsPerCrawl:
+    TODAY_ONLY
+      ? MAX_PAGES * 35 +
+        MAX_RESULTS * 3 +
+        50
+      : MAX_RESULTS * 3 + 50,
 
-            const pageNum = request.userData.pageNum || 1;
-            const baseUrl = request.userData.baseUrl;
-            const listUrl = pageNum === 1 ? baseUrl : `${baseUrl}/${pageNum}`;
+  requestHandlerTimeoutSecs: 240,
+  navigationTimeoutSecs: 60,
 
-            reqLog.info(`فتح صفحة القائمة رقم ${pageNum}: ${listUrl}`);
+  async requestHandler({
+    page,
+    request,
+    log: reqLog
+  }) {
+    if (
+      request.userData.label !== 'LIST'
+    ) {
+      return;
+    }
 
-            const response = await page.goto(listUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    const pageNum =
+      Number(request.userData.pageNum) || 1;
 
-            const status = response?.status();
-            if (status && status >= 400) {
-                reqLog.error(`⚠️ الرابط أعاد حالة ${status}: ${listUrl}`);
-                return;
-            }
+    const base =
+      request.userData.baseUrl;
 
-            const noResultsFound = await page.evaluate(() => {
-                const text = document.body.innerText || '';
-                return /لا توجد نتائج|لم يتم العثور|no results/i.test(text);
-            });
-            if (noResultsFound) {
-                reqLog.info(`ℹ️ لا مزيد من النتائج بعد صفحة ${pageNum - 1} — انتهت النتائج.`);
-                return;
-            }
+    const url =
+      pageNum === 1
+        ? base
+        : `${base}/${pageNum}`;
 
-            try {
-                await page.waitForSelector('a[href*="-"]', { timeout: 15000 });
-            } catch {
-                reqLog.warning('لم تظهر بطاقات، سيتم المتابعة...');
-            }
-            await page.waitForTimeout(1500);
+    reqLog.info(
+      `📄 صفحة ${pageNum}: ${url}`
+    );
 
-            const cards = await extractListCards(page);
+    const response =
+      await page
+        .goto(url, {
+          waitUntil:
+            'domcontentloaded',
+          timeout: 60000
+        })
+        .catch(() => null);
 
-            if (cards.length === 0) {
-                reqLog.info(`ℹ️ لا بطاقات (غير مميزة) في صفحة ${pageNum} — على الأرجح آخر صفحة.`);
-                return;
-            }
+    if (
+      !response ||
+      response.status() >= 400
+    ) {
+      return;
+    }
 
-            reqLog.info(`وُجدت ${cards.length} بطاقة غير مميزة في صفحة ${pageNum}`);
+    await page.waitForTimeout(900);
 
-            // ==========================================
-            // وضع "اليوم فقط": فحص شامل لكل الصفحات، بدون توقف مبكر،
-            // لأن ترتيب النتائج ليس زمنياً صارماً (إعلانات مميزة تتصدر بلا علاقة بالتاريخ)
-            // ==========================================
-            if (todayOnly) {
-                pagesScannedToday++;
+    const cards =
+      await extractCards(page);
 
-                for (const card of cards) {
-                    if (seenIds.has(card._raw_id)) continue;
-                    seenIds.add(card._raw_id);
+    if (!cards.length) return;
 
-                    const detail = await fetchDetail(page, card.url, reqLog);
+    if (TODAY_ONLY) {
+      pagesScanned++;
 
-                    if (!detail.posted_at_iso) {
-                        skippedNoDate++;
-                        reqLog.warning(`⚠️ تعذّر قراءة "تاريخ الإضافة" (نص خام: "${detail.date_raw || 'لم يُعثر عليه'}") — تم تجاوز الإعلان: ${card.url}`);
-                        continue;
-                    }
-
-                    if (!isFromToday(detail.posted_at_iso)) {
-                        // ليس من اليوم — نتجاوزه ونكمل فحص بقية البطاقات؛ لا إيقاف مبكر لعدم موثوقية الترتيب
-                        continue;
-                    }
-
-                    card.source = 'aqar';
-                    card.phone = detail.phone || card.phone;
-                    card.posted_at = detail.posted_at;
-                    card.posted_at_iso = detail.posted_at_iso;
-                    card.date_raw = detail.date_raw;
-                    card.bedrooms = detail.bedrooms;
-                    card.bathrooms = detail.bathrooms;
-                    card.owner_name = detail.owner_name;
-                    card.is_verified = detail.is_verified;
-                    card.rega_license = detail.rega_license || '';
-                    card.scanned_at = new Date().toISOString();
-
-                    const licenseMatch = card.description.match(/(?:رخصة فال|رخصه فال|ترخيص)\s*:?\s*(\d{6,})/);
-                    if (!card.rega_license && licenseMatch) card.rega_license = licenseMatch[1];
-
-                    finalItems.push(card);
-                    reqLog.info(`✅ [اليوم] ${card.name.slice(0, 40)} | ${card.priceSar} ريال | ${card.phone || 'لا جوال'} | تاريخ الإضافة في الموقع: "${detail.date_raw}"`);
-
-                    if (finalItems.length >= maxResults) {
-                        reqLog.info(`🎯 تم الوصول للحد الأقصى (${maxResults}) — إيقاف الزحف.`);
-                        return;
-                    }
-                }
-
-                reqLog.info(`📊 إجمالي إعلانات اليوم حتى الآن: ${finalItems.length} (بعد فحص ${pagesScannedToday} صفحة)`);
-
-                // ننتقل للصفحة التالية طالما لم نصل للحد الأقصى للنتائج أو لحد الصفحات الآمن
-                if (pagesScannedToday < maxPagesToScan) {
-                    await crawler.addRequests([{
-                        url: `${baseUrl}#page${pageNum + 1}`,
-                        uniqueKey: `list-page-${pageNum + 1}`,
-                        userData: { label: 'LIST', pageNum: pageNum + 1, baseUrl },
-                    }]);
-                } else {
-                    reqLog.warning(`⚠️ تم بلوغ الحد الأقصى للصفحات (${maxPagesToScan}) — قد توجد إعلانات إضافية من اليوم في صفحات لاحقة لم تُفحص. زد "maxPagesToScan" إذا لزم.`);
-                }
-
-            // ==========================================
-            // الوضع العادي (بدون فلترة تاريخ)
-            // ==========================================
-            } else {
-                let newCount = 0;
-                for (const card of cards) {
-                    if (seenIds.has(card._raw_id)) continue;
-                    if (finalItems.length >= maxResults) break;
-                    seenIds.add(card._raw_id);
-
-                    card.source = 'aqar';
-                    card.bedrooms = '';
-                    card.bathrooms = '';
-                    card.owner_name = '';
-                    card.rega_license = '';
-                    card.is_verified = false;
-                    card.posted_at = '';
-                    card.posted_at_iso = '';
-                    card.scanned_at = new Date().toISOString();
-
-                    const licenseMatch = card.description.match(/(?:رخصة فال|رخصه فال|ترخيص)\s*:?\s*(\d{6,})/);
-                    if (licenseMatch) card.rega_license = licenseMatch[1];
-
-                    finalItems.push(card);
-                    newCount++;
-                }
-
-                reqLog.info(`تم جمع ${finalItems.length} إعلان حتى الآن (صفحة ${pageNum})`);
-
-                if (finalItems.length < maxResults && newCount > 0 && pageNum < 50) {
-                    await crawler.addRequests([{
-                        url: `${baseUrl}#page${pageNum + 1}`,
-                        uniqueKey: `list-page-${pageNum + 1}`,
-                        userData: { label: 'LIST', pageNum: pageNum + 1, baseUrl },
-                    }]);
-                }
-
-                if (fetchPhoneFromDetail) {
-                    for (const item of cards) {
-                        if (!item.phone) {
-                            await crawler.addRequests([{
-                                url: item.url,
-                                userData: { label: 'DETAIL', rawId: item._raw_id },
-                            }]);
-                        }
-                    }
-                }
-            }
-
-        // ==========================================
-        // مسار 2: صفحة تفاصيل الإعلان (الوضع العادي فقط)
-        // ==========================================
-        } else if (request.userData.label === 'DETAIL') {
-
-            const rawId = request.userData.rawId;
-            reqLog.info(`فتح تفاصيل الإعلان ${rawId}`);
-
-            const detail = await fetchDetail(page, request.url, reqLog);
-
-            const idx = finalItems.findIndex(i => i._raw_id === rawId);
-            if (idx !== -1) {
-                if (detail.phone) finalItems[idx].phone = detail.phone;
-                finalItems[idx].posted_at     = detail.posted_at;
-                finalItems[idx].posted_at_iso = detail.posted_at_iso;
-                finalItems[idx].bedrooms      = detail.bedrooms  || finalItems[idx].bedrooms;
-                finalItems[idx].bathrooms     = detail.bathrooms || finalItems[idx].bathrooms;
-                finalItems[idx].owner_name    = detail.owner_name || finalItems[idx].owner_name;
-                finalItems[idx].is_verified   = detail.is_verified;
-                finalItems[idx].rega_license  = detail.rega_license || finalItems[idx].rega_license;
-
-                reqLog.info(`✅ ${finalItems[idx].name.slice(0, 40)} | ${finalItems[idx].priceSar} ريال | ${finalItems[idx].phone || 'لا جوال'}`);
-            }
+      for (const card of cards) {
+        if (
+          items.length >= MAX_RESULTS ||
+          seen.has(card._raw_id)
+        ) {
+          continue;
         }
-    },
 
-    async failedRequestHandler({ request }, error) {
-        log.error(`❌ فشل: ${request.url} — ${error.message}`);
-    },
+        seen.add(card._raw_id);
+
+        let d;
+
+        try {
+          d = await detail(
+            page,
+            card.url,
+            reqLog
+          );
+        } catch {
+          continue;
+        }
+
+        if (!d.posted_at_iso) {
+          skippedNoDate++;
+          continue;
+        }
+
+        if (!isToday(d.posted_at_iso)) {
+          continue;
+        }
+
+        Object.assign(
+          card,
+          d,
+          {
+            source: 'aqar',
+            scanned_at:
+              new Date().toISOString()
+          }
+        );
+
+        if (!card.rega_license) {
+          card.rega_license =
+            card.description.match(
+              /(?:رخصة فال|رخصه فال|ترخيص)\s*:?\s*(\d{6,})/
+            )?.[1] || '';
+        }
+
+        items.push(card);
+
+        reqLog.info(
+          `✅ ${card.name.slice(0, 40)} | ` +
+          `${card.phone || 'لا جوال'}`
+        );
+      }
+    } else {
+      for (const card of cards) {
+        if (
+          items.length >= MAX_RESULTS ||
+          seen.has(card._raw_id)
+        ) {
+          continue;
+        }
+
+        seen.add(card._raw_id);
+
+        card.source = 'aqar';
+        card.bedrooms = '';
+        card.bathrooms = '';
+        card.owner_name = '';
+
+        card.rega_license =
+          card.description.match(
+            /(?:رخصة فال|رخصه فال|ترخيص)\s*:?\s*(\d{6,})/
+          )?.[1] || '';
+
+        card.is_verified = false;
+        card.posted_at = '';
+        card.posted_at_iso = '';
+        card.scanned_at =
+          new Date().toISOString();
+
+        items.push(card);
+      }
+
+      if (FETCH_PHONE) {
+        for (
+          const card of items.filter(
+            x => !x.phone
+          )
+        ) {
+          await crawler.addRequests([
+            {
+              url: card.url,
+
+              uniqueKey:
+                `detail-${card._raw_id}`,
+
+              userData: {
+                label: 'DETAIL',
+                rawId: card._raw_id
+              }
+            }
+          ]);
+        }
+      }
+    }
+
+    const pageLimit =
+      TODAY_ONLY
+        ? MAX_PAGES
+        : 50;
+
+    if (
+      items.length < MAX_RESULTS &&
+      pageNum < pageLimit
+    ) {
+      await crawler.addRequests([
+        {
+          url:
+            `${base}/${pageNum + 1}`,
+
+          uniqueKey:
+            `list-${encodeURIComponent(base)}-${pageNum + 1}`,
+
+          userData: {
+            label: 'LIST',
+            pageNum: pageNum + 1,
+            baseUrl: base
+          }
+        }
+      ]);
+    }
+  },
+
+  async failedRequestHandler({
+    request,
+    error
+  }) {
+    log.error(
+      `❌ ${request.url} — ${error.message}`
+    );
+  }
 });
 
-const initialUrl = buildListUrl();
-log.info(`🔗 رابط البحث المُركّب: ${initialUrl}`);
-if (todayOnly) {
-    log.info(`📅 وضع "اليوم فقط" مُفعّل — التاريخ المستهدف: ${TODAY_RIYADH} (توقيت الرياض)`);
+const initial =
+  listUrl(1);
+
+log.info(
+  `🔗 ${initial}`
+);
+
+if (TODAY_ONLY) {
+  log.info(
+    `📅 اليوم: ${TODAY}`
+  );
 }
 
-await crawler.run([{
-    url: initialUrl,
-    userData: { label: 'LIST', pageNum: 1, baseUrl: initialUrl },
-}]);
+await crawler.run([
+  {
+    url: initial,
 
-for (const item of finalItems) {
-    await Actor.pushData(item);
-}
+    uniqueKey:
+      `list-${encodeURIComponent(initial)}-1`,
 
-log.info(`🎉 اكتمل! تم استخراج ${finalItems.length} إعلان${todayOnly ? ` من اليوم (بعد فحص ${pagesScannedToday} صفحة، مع تجاهل الإعلانات المميزة؛ ${skippedNoDate} إعلان رُفض لتعذّر قراءة تاريخه)` : ''}.`);
-
-if (finalItems.length === 0) {
-    if (todayOnly) {
-        log.warning(`⚠️ لم يُعثر على أي إعلان من اليوم بعد فحص ${pagesScannedToday} صفحة. قد لا توجد إعلانات جديدة اليوم لهذا البحث تحديداً، أو تحتاج زيادة "maxPagesToScan".`);
-    } else {
-        log.warning('⚠️ لم يتم استخراج أي إعلان. تأكد من صحة الرابط.');
+    userData: {
+      label: 'LIST',
+      pageNum: 1,
+      baseUrl: initial
     }
+  }
+]);
+
+for (const item of items) {
+  await Actor.pushData(item);
 }
 
-if (webhookUrl && webhookUrl.trim()) {
-    try {
-        const datasetId = process.env.APIFY_DEFAULT_DATASET_ID;
-        await fetch(webhookUrl, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                status: 'success',
-                search,
-                city,
-                itemsCount: finalItems.length,
-                downloadUrl: `https://api.apify.com/v2/datasets/${datasetId}/items?format=json`,
-            }),
-        });
-        log.info('✅ Webhook أُرسل بنجاح.');
-    } catch (err) {
-        log.error(`❌ فشل Webhook: ${err.message}`);
+log.info(
+  `🎉 تم استخراج ${items.length} إعلان` +
+  (
+    TODAY_ONLY
+      ? ` من اليوم بعد فحص ${pagesScanned} صفحة`
+      : ''
+  )
+);
+
+if (webhookUrl?.trim()) {
+  try {
+    const datasetId =
+      process.env.APIFY_DEFAULT_DATASET_ID;
+
+    if (!datasetId) {
+      throw new Error(
+        'APIFY_DEFAULT_DATASET_ID غير متاح'
+      );
     }
+
+    await fetch(
+      webhookUrl.trim(),
+      {
+        method: 'POST',
+
+        headers: {
+          'Content-Type':
+            'application/json'
+        },
+
+        body: JSON.stringify({
+          status: 'success',
+          search,
+          city,
+          itemsCount: items.length,
+
+          downloadUrl:
+            `https://api.apify.com/v2/datasets/${datasetId}/items?format=json`
+        })
+      }
+    );
+
+    log.info(
+      '✅ Webhook أُرسل بنجاح'
+    );
+  } catch (e) {
+    log.error(
+      `❌ Webhook: ${e.message}`
+    );
+  }
 }
 
 await Actor.exit();
-                        
