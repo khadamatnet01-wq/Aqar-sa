@@ -255,6 +255,38 @@ function parseArabicRelativeDate(text) {
     return null;
 }
 
+// تحليل تاريخ صريح بصيغة DD/MM/YYYY (أو YYYY-MM-DD) دون الاعتماد على new Date()
+// لأنه يفسّر "12/05/2026" بالنمط الأمريكي (MM/DD) فيقلب اليوم والشهر
+function parseExplicitDate(text) {
+    if (!text) return null;
+    const normalized = text
+        .replace(/[٠-٩]/g, d => '٠١٢٣٤٥٦٧٨٩'.indexOf(d))
+        .replace(/[۰-۹]/g, d => '۰۱۲۳۴۵۶۷۸۹'.indexOf(d))
+        .trim();
+    const pad = (n) => String(n).padStart(2, '0');
+    const valid = (y, mo, d) => mo >= 1 && mo <= 12 && d >= 1 && d <= 31 && y >= 2000 && y <= 2100;
+
+    let m = normalized.match(/(?:^|\D)(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})(?:\D|$)/);
+    if (m) {
+        const d = parseInt(m[1], 10), mo = parseInt(m[2], 10), y = parseInt(m[3], 10);
+        if (valid(y, mo, d)) return new Date(`${y}-${pad(mo)}-${pad(d)}T12:00:00+03:00`); // منتصف النهار بتوقيت الرياض
+        return null;
+    }
+    m = normalized.match(/(?:^|\D)(\d{4})[\/\-.](\d{1,2})[\/\-.](\d{1,2})(?:\D|$)/);
+    if (m) {
+        const y = parseInt(m[1], 10), mo = parseInt(m[2], 10), d = parseInt(m[3], 10);
+        if (valid(y, mo, d)) return new Date(`${y}-${pad(mo)}-${pad(d)}T12:00:00+03:00`);
+    }
+    return null;
+}
+
+// عرض ميلادي (يطابق ما يظهر في الموقع) بتوقيت الرياض
+function formatPostedAt(date, withTime) {
+    const opts = { timeZone: 'Asia/Riyadh', year: 'numeric', month: '2-digit', day: '2-digit' };
+    if (withTime) { opts.hour = '2-digit'; opts.minute = '2-digit'; opts.hour12 = false; }
+    return date.toLocaleString('en-GB', opts);
+}
+
 async function fetchDetail(page, url, reqLog) {
     await page.route('**/*', (route) => {
         const type = route.request().resourceType();
@@ -296,6 +328,7 @@ async function fetchDetail(page, url, reqLog) {
 
     let posted_at = '';
     let posted_at_iso = '';
+    let date_raw = '';
     let bedrooms = '';
     let bathrooms = '';
     let owner_name = '';
@@ -347,50 +380,45 @@ async function fetchDetail(page, url, reqLog) {
     }
 
     if (!posted_at) {
-        // البحث المستهدف: نص يحتوي "منذ ..." بجانب تسمية "تاريخ الإضافة"، بناءً على البنية الفعلية للموقع
-        const domDateRaw = await page.evaluate(() => {
-            const all = document.querySelectorAll('*');
-            for (const el of all) {
-                if (el.children.length === 0 && el.textContent && /^منذ\s/.test(el.textContent.trim()) && el.textContent.length < 40) {
-                    return el.textContent.trim();
+        // نقرأ القيمة المرتبطة بتسمية "تاريخ الإضافة" تحديداً، وليس أي نص "منذ ..." في الصفحة
+        // (قد يكون وقت تحديث الإعلان أو بطاقة إعلان مشابه). لا يوجد fallback عام عمداً لتفادي قبول تاريخ خاطئ.
+        const found = await page.evaluate(() => {
+            const LABEL = 'تاريخ الإضافة';
+            const toLatin = (s) => s
+                .replace(/[٠-٩]/g, d => '٠١٢٣٤٥٦٧٨٩'.indexOf(d))
+                .replace(/[۰-۹]/g, d => '۰۱۲۳۴۵۶۷۸۹'.indexOf(d));
+            const valueRe = /(\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{4}|\d{4}[\/\-.]\d{1,2}[\/\-.]\d{1,2}|منذ\s+[^\n]{1,30})/;
+            const labels = Array.from(document.querySelectorAll('*'))
+                .filter(el => el.children.length === 0 && (el.textContent || '').trim() === LABEL);
+            for (const label of labels) {
+                let node = label;
+                for (let depth = 0; depth < 5 && node; depth++, node = node.parentElement) {
+                    const text = toLatin(node.innerText || '');
+                    const idx = text.indexOf(LABEL);
+                    if (idx === -1) continue;
+                    const m = text.slice(idx + LABEL.length).match(valueRe);
+                    if (m) return m[0].trim(); // أقرب قيمة تأتي بعد التسمية
                 }
             }
-            // fallback أوسع: أي عنصر تاريخ صريح
-            const timeEl = document.querySelector('time[datetime], [class*="date"], [class*="publish"]');
-            return timeEl?.getAttribute('datetime') || timeEl?.innerText?.trim() || '';
+            return '';
         });
 
-        if (domDateRaw) {
-            // أولاً نحاول تحليله كنص نسبي عربي ("منذ 9 ساعات تقريباً")
-            const relativeDate = parseArabicRelativeDate(domDateRaw);
-            if (relativeDate) {
-                posted_at_iso = relativeDate.toISOString();
-                posted_at = relativeDate.toLocaleString('ar-SA', {
-                    timeZone: 'Asia/Riyadh',
-                    year: 'numeric', month: '2-digit', day: '2-digit',
-                    hour: '2-digit', minute: '2-digit',
-                });
-            } else {
-                // وإلا نحاول تحليله كتاريخ قياسي (ISO أو مشابه)
-                const d = new Date(domDateRaw);
-                if (!isNaN(d.getTime())) {
-                    posted_at_iso = d.toISOString();
-                    posted_at = d.toLocaleString('ar-SA', {
-                        timeZone: 'Asia/Riyadh',
-                        year: 'numeric', month: '2-digit', day: '2-digit',
-                        hour: '2-digit', minute: '2-digit',
-                    });
-                } else {
-                    posted_at = domDateRaw; // نحفظ النص الخام على الأقل، حتى لو تعذّر تحويله
-                }
+        if (found) {
+            date_raw = found;
+            const explicit = parseExplicitDate(found);
+            const parsed = explicit || parseArabicRelativeDate(found);
+            if (parsed) {
+                posted_at_iso = parsed.toISOString();
+                posted_at = formatPostedAt(parsed, !explicit);
             }
         }
     }
 
-    return { phone, posted_at, posted_at_iso, bedrooms, bathrooms, owner_name, is_verified, rega_license };
+    return { phone, posted_at, posted_at_iso, date_raw, bedrooms, bathrooms, owner_name, is_verified, rega_license };
 }
 
 let pagesScannedToday = 0; // عداد الصفحات التي فُحصت فعلياً في وضع اليوم
+let skippedNoDate = 0;    // إعلانات لم نستطع قراءة تاريخ إضافتها فتُرفض بدل التخمين
 
 const crawler = new PlaywrightCrawler({
     proxyConfiguration,
@@ -406,7 +434,7 @@ const crawler = new PlaywrightCrawler({
         // ==========================================
         // مسار 1: صفحة القائمة
         // ==========================================
-        if (request.userData.label === 'LIST') {
+    if (request.userData.label === 'LIST') {
 
             const pageNum = request.userData.pageNum || 1;
             const baseUrl = request.userData.baseUrl;
@@ -461,7 +489,8 @@ const crawler = new PlaywrightCrawler({
                     const detail = await fetchDetail(page, card.url, reqLog);
 
                     if (!detail.posted_at_iso) {
-                        reqLog.warning(`⚠️ لا يوجد تاريخ نشر واضح، تم تجاوز الإعلان: ${card.url}`);
+                        skippedNoDate++;
+                        reqLog.warning(`⚠️ تعذّر قراءة "تاريخ الإضافة" (نص خام: "${detail.date_raw || 'لم يُعثر عليه'}") — تم تجاوز الإعلان: ${card.url}`);
                         continue;
                     }
 
@@ -474,6 +503,7 @@ const crawler = new PlaywrightCrawler({
                     card.phone = detail.phone || card.phone;
                     card.posted_at = detail.posted_at;
                     card.posted_at_iso = detail.posted_at_iso;
+                    card.date_raw = detail.date_raw;
                     card.bedrooms = detail.bedrooms;
                     card.bathrooms = detail.bathrooms;
                     card.owner_name = detail.owner_name;
@@ -485,7 +515,7 @@ const crawler = new PlaywrightCrawler({
                     if (!card.rega_license && licenseMatch) card.rega_license = licenseMatch[1];
 
                     finalItems.push(card);
-                    reqLog.info(`✅ [اليوم] ${card.name.slice(0, 40)} | ${card.priceSar} ريال | ${card.phone || 'لا جوال'} | ${card.posted_at}`);
+                    reqLog.info(`✅ [اليوم] ${card.name.slice(0, 40)} | ${card.priceSar} ريال | ${card.phone || 'لا جوال'} | تاريخ الإضافة في الموقع: "${detail.date_raw}"`);
 
                     if (finalItems.length >= maxResults) {
                         reqLog.info(`🎯 تم الوصول للحد الأقصى (${maxResults}) — إيقاف الزحف.`);
@@ -601,7 +631,7 @@ for (const item of finalItems) {
     await Actor.pushData(item);
 }
 
-log.info(`🎉 اكتمل! تم استخراج ${finalItems.length} إعلان${todayOnly ? ` من اليوم (بعد فحص ${pagesScannedToday} صفحة، مع تجاهل الإعلانات المميزة)` : ''}.`);
+log.info(`🎉 اكتمل! تم استخراج ${finalItems.length} إعلان${todayOnly ? ` من اليوم (بعد فحص ${pagesScannedToday} صفحة، مع تجاهل الإعلانات المميزة؛ ${skippedNoDate} إعلان رُفض لتعذّر قراءة تاريخه)` : ''}.`);
 
 if (finalItems.length === 0) {
     if (todayOnly) {
@@ -632,3 +662,4 @@ if (webhookUrl && webhookUrl.trim()) {
 }
 
 await Actor.exit();
+                        
