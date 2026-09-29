@@ -1,6 +1,7 @@
 // -*- coding: utf-8 -*-
 
 import { Actor, log } from 'apify';
+import { chromium } from 'playwright';
 
 await Actor.init();
 
@@ -19,7 +20,8 @@ const {
     todayOnly = true,
     fetchPhoneFromDetail = true,
 
-    concurrency = 8,
+    // مهم: لا ترفعها كثيراً لأن الهاتف يستخدم Playwright
+    concurrency = 3,
 
     webhookUrl = '',
 
@@ -34,8 +36,8 @@ const MAX_PAGES =
 
 const CONCURRENCY =
     Math.min(
-        20,
-        Math.max(1, Number(concurrency) || 8)
+        5,
+        Math.max(1, Number(concurrency) || 3)
     );
 
 const TODAY_ONLY =
@@ -61,21 +63,32 @@ let pagesScanned = 0;
 let detailsChecked = 0;
 let dateFound = 0;
 let dateMissing = 0;
+let phonesFound = 0;
+let phonesMissing = 0;
 
-const TODAY = new Intl.DateTimeFormat(
-    'en-CA',
-    {
-        timeZone: 'Asia/Riyadh',
-        year: 'numeric',
-        month: '2-digit',
-        day: '2-digit'
-    }
-).format(new Date());
+let browser = null;
+
+const TODAY =
+    new Intl.DateTimeFormat(
+        'en-CA',
+        {
+            timeZone: 'Asia/Riyadh',
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit'
+        }
+    ).format(new Date());
 
 log.info(`📅 تاريخ الرياض: ${TODAY}`);
-log.info(`⚡ HTTP mode`);
-log.info(`⚡ Concurrency: ${CONCURRENCY}`);
-log.info(`🎯 الحد: ${MAX_RESULTS}`);
+log.info(`⚡ وضع السحب: HTTP + Playwright للهاتف فقط`);
+log.info(`⚡ توازي التفاصيل: ${CONCURRENCY}`);
+log.info(`🎯 الحد المطلوب: ${MAX_RESULTS}`);
+log.info(`📱 جلب الهاتف: ${FETCH_PHONE}`);
+
+
+/* =========================================================
+   أدوات عامة
+========================================================= */
 
 function normalize(value) {
     return String(value || '')
@@ -117,21 +130,20 @@ function arabicDigits(value) {
     return String(value || '')
         .replace(/[٠-٩]/g, d =>
             String(
-                '٠١٢٣٤٥٦٧٨٩'
-                    .indexOf(d)
+                '٠١٢٣٤٥٦٧٨٩'.indexOf(d)
             )
         )
         .replace(/[۰-۹]/g, d =>
             String(
-                '۰۱۲۳۴۵۶۷۸۹'
-                    .indexOf(d)
+                '۰۱۲۳۴۵۶۷۸۹'.indexOf(d)
             )
         );
 }
 
 function normalizePhone(value) {
-    let phone = arabicDigits(value)
-        .replace(/[^\d+]/g, '');
+    let phone =
+        arabicDigits(value)
+            .replace(/[^\d+]/g, '');
 
     if (phone.startsWith('+9665')) {
         phone =
@@ -147,8 +159,7 @@ function normalizePhone(value) {
 
     if (phone.startsWith('5')) {
         phone =
-            '0' +
-            phone;
+            '0' + phone;
     }
 
     return /^05\d{8}$/.test(phone)
@@ -161,268 +172,27 @@ function extractPhone(text) {
         arabicDigits(text)
             .replace(/[\s\-().]/g, '');
 
-    const match =
-        value.match(
-            /(?:\+966|966|0)?5\d{8}/
-        );
+    const patterns = [
+        /(?:\+966|00966|966|0)?5\d{8}/,
+        /05\d{8}/,
+        /5\d{8}/
+    ];
 
-    return match
-        ? normalizePhone(match[0])
-        : '';
-}
+    for (const pattern of patterns) {
+        const match =
+            value.match(pattern);
 
-function dateFromParts(
-    year,
-    month,
-    day
-) {
-    const y = Number(year);
-    const m = Number(month);
-    const d = Number(day);
+        if (match) {
+            const phone =
+                normalizePhone(match[0]);
 
-    if (
-        y < 2000 ||
-        y > 2100 ||
-        m < 1 ||
-        m > 12 ||
-        d < 1 ||
-        d > 31
-    ) {
-        return null;
-    }
-
-    const date = new Date(
-        `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}T12:00:00+03:00`
-    );
-
-    return Number.isNaN(
-        date.getTime()
-    )
-        ? null
-        : date;
-}
-
-function parseExplicitDate(value) {
-    if (!value) return null;
-
-    const text =
-        arabicDigits(value)
-            .trim();
-
-    let match =
-        text.match(
-            /(?:^|\D)(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})(?:\D|$)/
-        );
-
-    if (match) {
-        return dateFromParts(
-            match[3],
-            match[2],
-            match[1]
-        );
-    }
-
-    match =
-        text.match(
-            /(?:^|\D)(\d{4})[\/\-.](\d{1,2})[\/\-.](\d{1,2})(?:\D|$)/
-        );
-
-    if (match) {
-        return dateFromParts(
-            match[1],
-            match[2],
-            match[3]
-        );
-    }
-
-    return null;
-}
-
-function parseRelativeDate(value) {
-    if (!value) return null;
-
-    const text =
-        arabicDigits(value)
-            .replace(
-                /تقريباً|تقريبا|تقريب/g,
-                ''
-            )
-            .trim();
-
-    const now = new Date();
-
-    if (
-        /اليوم|الآن|منذ لحظات|منذ قليل/
-            .test(text)
-    ) {
-        return now;
-    }
-
-    if (/أمس/.test(text)) {
-        now.setDate(
-            now.getDate() - 1
-        );
-
-        return now;
-    }
-
-    const words = {
-        ثلاثة: 3,
-        ثلاث: 3,
-        أربعة: 4,
-        أربع: 4,
-        خمسة: 5,
-        خمس: 5,
-        ستة: 6,
-        ست: 6,
-        سبعة: 7,
-        سبع: 7,
-        ثمانية: 8,
-        ثمان: 8,
-        تسعة: 9,
-        تسع: 9,
-        عشرة: 10,
-        عشر: 10
-    };
-
-    const match =
-        text.match(
-            /منذ\s+([\u0621-\u064A0-9]+)\s+(ثانية|ثواني|دقيقة|دقائق|ساعة|ساعات|يوم|أيام|أسبوع|أسابيع|شهر|أشهر|سنة|سنوات)/
-        );
-
-    if (!match) {
-        return null;
-    }
-
-    let amount =
-        Number(match[1]);
-
-    if (
-        Number.isNaN(amount)
-    ) {
-        amount =
-            words[match[1]];
-    }
-
-    if (!amount) {
-        return null;
-    }
-
-    const unit =
-        match[2];
-
-    if (/ثانية/.test(unit)) {
-        now.setSeconds(
-            now.getSeconds() - amount
-        );
-    } else if (/دقيقة/.test(unit)) {
-        now.setMinutes(
-            now.getMinutes() - amount
-        );
-    } else if (/ساعة/.test(unit)) {
-        now.setHours(
-            now.getHours() - amount
-        );
-    } else if (/يوم/.test(unit)) {
-        now.setDate(
-            now.getDate() - amount
-        );
-    } else if (/أسبوع/.test(unit)) {
-        now.setDate(
-            now.getDate() -
-            amount * 7
-        );
-    } else if (/شهر/.test(unit)) {
-        now.setMonth(
-            now.getMonth() - amount
-        );
-    } else if (/سنة/.test(unit)) {
-        now.setFullYear(
-            now.getFullYear() -
-            amount
-        );
-    }
-
-    return now;
-}
-
-function parseDate(value) {
-    if (!value) return null;
-
-    return (
-        parseExplicitDate(value) ||
-        parseRelativeDate(value) ||
-        parseNativeDate(value)
-    );
-}
-
-function parseNativeDate(value) {
-    const date =
-        new Date(value);
-
-    if (
-        Number.isNaN(
-            date.getTime()
-        )
-    ) {
-        return null;
-    }
-
-    if (
-        date.getFullYear() < 2000
-    ) {
-        return null;
-    }
-
-    return date;
-}
-
-function isToday(date) {
-    if (!date) return false;
-
-    const value =
-        new Intl.DateTimeFormat(
-            'en-CA',
-            {
-                timeZone:
-                    'Asia/Riyadh',
-                year: 'numeric',
-                month: '2-digit',
-                day: '2-digit'
+            if (phone) {
+                return phone;
             }
-        ).format(date);
-
-    return value === TODAY;
-}
-
-function formatDate(date) {
-    if (!date) return '';
-
-    return date.toLocaleString(
-        'en-GB',
-        {
-            timeZone:
-                'Asia/Riyadh',
-            year: 'numeric',
-            month: '2-digit',
-            day: '2-digit',
-            hour: '2-digit',
-            minute: '2-digit',
-            hour12: false
         }
-    );
-}
+    }
 
-function listingId(url) {
-    const match =
-        String(url || '')
-            .match(
-                /-(\d{5,})(?:\/)?(?:[?#].*)?$/
-            );
-
-    return match
-        ? match[1]
-        : '';
+    return '';
 }
 
 function decodeHtml(value) {
@@ -458,11 +228,271 @@ function stripTags(value) {
     );
 }
 
-/*
- * يحاول استخراج نصوص RSC الخاصة بـ Next.js.
- * عقار يستخدم Next.js App Router، لذلك لا نعتمد
- * على __NEXT_DATA__ فقط.
- */
+
+/* =========================================================
+   التاريخ
+========================================================= */
+
+function dateFromParts(
+    year,
+    month,
+    day
+) {
+    const y = Number(year);
+    const m = Number(month);
+    const d = Number(day);
+
+    if (
+        y < 2000 ||
+        y > 2100 ||
+        m < 1 ||
+        m > 12 ||
+        d < 1 ||
+        d > 31
+    ) {
+        return null;
+    }
+
+    const date =
+        new Date(
+            `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}T12:00:00+03:00`
+        );
+
+    return Number.isNaN(
+        date.getTime()
+    )
+        ? null
+        : date;
+}
+
+function parseExplicitDate(value) {
+    if (!value) {
+        return null;
+    }
+
+    const text =
+        arabicDigits(value).trim();
+
+    let match =
+        text.match(
+            /(?:^|\D)(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})(?:\D|$)/
+        );
+
+    if (match) {
+        return dateFromParts(
+            match[3],
+            match[2],
+            match[1]
+        );
+    }
+
+    match =
+        text.match(
+            /(?:^|\D)(\d{4})[\/\-.](\d{1,2})[\/\-.](\d{1,2})(?:\D|$)/
+        );
+
+    if (match) {
+        return dateFromParts(
+            match[1],
+            match[2],
+            match[3]
+        );
+    }
+
+    return null;
+}
+
+function parseRelativeDate(value) {
+    if (!value) {
+        return null;
+    }
+
+    const text =
+        arabicDigits(value)
+            .replace(
+                /تقريباً|تقريبا|تقريب/g,
+                ''
+            )
+            .trim();
+
+    const now = new Date();
+
+    if (
+        /اليوم|الآن|منذ لحظات|منذ قليل/
+            .test(text)
+    ) {
+        return now;
+    }
+
+    if (/أمس/.test(text)) {
+        now.setDate(
+            now.getDate() - 1
+        );
+
+        return now;
+    }
+
+    const words = {
+        واحد: 1,
+        واحدة: 1,
+        اثنان: 2,
+        اثنتان: 2,
+        اثنين: 2,
+        ثلاثة: 3,
+        ثلاث: 3,
+        أربعة: 4,
+        أربع: 4,
+        خمسة: 5,
+        خمس: 5,
+        ستة: 6,
+        ست: 6,
+        سبعة: 7,
+        سبع: 7,
+        ثمانية: 8,
+        ثمان: 8,
+        تسعة: 9,
+        تسع: 9,
+        عشرة: 10,
+        عشر: 10
+    };
+
+    const match =
+        text.match(
+            /منذ\s+([\u0621-\u064A0-9]+)\s+(ثانية|ثواني|دقيقة|دقائق|ساعة|ساعات|يوم|أيام|أسبوع|أسابيع|شهر|أشهر|سنة|سنوات)/
+        );
+
+    if (!match) {
+        return null;
+    }
+
+    let amount =
+        Number(match[1]);
+
+    if (Number.isNaN(amount)) {
+        amount =
+            words[match[1]];
+    }
+
+    if (!amount) {
+        return null;
+    }
+
+    const unit =
+        match[2];
+
+    if (/ثانية/.test(unit)) {
+        now.setSeconds(
+            now.getSeconds() - amount
+        );
+    } else if (/دقيقة/.test(unit)) {
+        now.setMinutes(
+            now.getMinutes() - amount
+        );
+    } else if (/ساعة/.test(unit)) {
+        now.setHours(
+            now.getHours() - amount
+        );
+    } else if (/يوم/.test(unit)) {
+        now.setDate(
+            now.getDate() - amount
+        );
+    } else if (/أسبوع/.test(unit)) {
+        now.setDate(
+            now.getDate() - amount * 7
+        );
+    } else if (/شهر/.test(unit)) {
+        now.setMonth(
+            now.getMonth() - amount
+        );
+    } else if (/سنة/.test(unit)) {
+        now.setFullYear(
+            now.getFullYear() - amount
+        );
+    }
+
+    return now;
+}
+
+function parseNativeDate(value) {
+    if (!value) {
+        return null;
+    }
+
+    const date =
+        new Date(value);
+
+    if (
+        Number.isNaN(
+            date.getTime()
+        )
+    ) {
+        return null;
+    }
+
+    if (
+        date.getFullYear() < 2000
+    ) {
+        return null;
+    }
+
+    return date;
+}
+
+function parseDate(value) {
+    if (!value) {
+        return null;
+    }
+
+    return (
+        parseExplicitDate(value) ||
+        parseRelativeDate(value) ||
+        parseNativeDate(value)
+    );
+}
+
+function isToday(date) {
+    if (!date) {
+        return false;
+    }
+
+    const value =
+        new Intl.DateTimeFormat(
+            'en-CA',
+            {
+                timeZone: 'Asia/Riyadh',
+                year: 'numeric',
+                month: '2-digit',
+                day: '2-digit'
+            }
+        ).format(date);
+
+    return value === TODAY;
+}
+
+function formatDate(date) {
+    if (!date) {
+        return '';
+    }
+
+    return date.toLocaleString(
+        'en-GB',
+        {
+            timeZone: 'Asia/Riyadh',
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit',
+            hour: '2-digit',
+            minute: '2-digit',
+            hour12: false
+        }
+    );
+}
+
+
+/* =========================================================
+   Next.js / RSC
+========================================================= */
+
 function extractRscScripts(html) {
     const scripts = [];
 
@@ -502,8 +532,7 @@ function extractRscStrings(html) {
         let match;
 
         while (
-            (match =
-                regex.exec(script))
+            (match = regex.exec(script))
         ) {
             try {
                 output.push(
@@ -518,90 +547,6 @@ function extractRscStrings(html) {
     }
 
     return output;
-}
-
-function findListingObjects(
-    html
-) {
-    const strings =
-        extractRscStrings(html);
-
-    const combined =
-        strings.join('\n');
-
-    const objects = [];
-    const used = new Set();
-
-    /*
-     * نبحث عن كائنات تحتوي على ID
-     * ورابط/عنوان/سعر.
-     */
-    const patterns = [
-        /"id"\s*:\s*"(\d{5,})"/g,
-        /"id"\s*:\s*(\d{5,})/g,
-        /"propertyId"\s*:\s*"(\d{5,})"/g,
-        /"property_id"\s*:\s*"(\d{5,})"/g
-    ];
-
-    const ids = [];
-
-    for (const pattern of patterns) {
-        let match;
-
-        while (
-            (match =
-                pattern.exec(combined))
-        ) {
-            const id =
-                String(match[1]);
-
-            if (
-                !used.has(id)
-            ) {
-                used.add(id);
-                ids.push(id);
-            }
-        }
-    }
-
-    for (const id of ids) {
-        const index =
-            combined.indexOf(
-                `"${id}"`
-            );
-
-        if (index < 0) continue;
-
-        const start =
-            Math.max(
-                0,
-                index - 4000
-            );
-
-        const end =
-            Math.min(
-                combined.length,
-                index + 12000
-            );
-
-        const chunk =
-            combined.slice(
-                start,
-                end
-            );
-
-        const item =
-            parseListingChunk(
-                chunk,
-                id
-            );
-
-        if (item) {
-            objects.push(item);
-        }
-    }
-
-    return objects;
 }
 
 function extractValue(
@@ -626,9 +571,47 @@ function extractValue(
                 return String(
                     match[1]
                 )
-                    .replace(/^["']|["']$/g, '')
+                    .replace(
+                        /^["']|["']$/g,
+                        ''
+                    )
                     .trim();
             }
+        }
+    }
+
+    return '';
+}
+
+function findListingUrl(
+    chunk,
+    id
+) {
+    const patterns = [
+        new RegExp(
+            `"url"\\s*:\\s*"([^"]*${id}[^"]*)"`
+        ),
+        new RegExp(
+            `"(?:href|link)"\\s*:\\s*"([^"]*${id}[^"]*)"`
+        )
+    ];
+
+    for (const pattern of patterns) {
+        const match =
+            chunk.match(pattern);
+
+        if (match) {
+            return decodeHtml(
+                match[1]
+            )
+                .replace(
+                    /\\u002F/g,
+                    '/'
+                )
+                .replace(
+                    /\\\//g,
+                    '/'
+                );
         }
     }
 
@@ -788,11 +771,9 @@ function parseListingChunk(
                 ''
             ),
 
-        city:
-            cityName,
+        city: cityName,
 
-        district:
-            districtName,
+        district: districtName,
 
         description,
 
@@ -803,9 +784,7 @@ function parseListingChunk(
         postedRaw,
 
         postedDate:
-            parseDate(
-                postedRaw
-            ),
+            parseDate(postedRaw),
 
         images:
             image
@@ -821,42 +800,88 @@ function parseListingChunk(
     };
 }
 
-function findListingUrl(
-    chunk,
-    id
-) {
+function findListingObjects(html) {
+    const strings =
+        extractRscStrings(html);
+
+    const combined =
+        strings.join('\n');
+
+    const objects = [];
+    const used = new Set();
+
     const patterns = [
-        new RegExp(
-            `"url"\\s*:\\s*"([^"]*${id}[^"]*)"`
-        ),
-        new RegExp(
-            `"(?:href|link)"\\s*:\\s*"([^"]*${id}[^"]*)"`
-        )
+        /"id"\s*:\s*"(\d{5,})"/g,
+        /"id"\s*:\s*(\d{5,})/g,
+        /"propertyId"\s*:\s*"(\d{5,})"/g,
+        /"property_id"\s*:\s*"(\d{5,})"/g
     ];
 
-    for (
-        const pattern of patterns
-    ) {
-        const match =
-            chunk.match(pattern);
+    const ids = [];
 
-        if (match) {
-            return decodeHtml(
-                match[1]
-            )
-                .replace(
-                    /\\u002F/g,
-                    '/'
-                )
-                .replace(
-                    /\\\//g,
-                    '/'
-                );
+    for (const pattern of patterns) {
+        let match;
+
+        while (
+            (match =
+                pattern.exec(combined))
+        ) {
+            const id =
+                String(match[1]);
+
+            if (!used.has(id)) {
+                used.add(id);
+                ids.push(id);
+            }
         }
     }
 
-    return '';
+    for (const id of ids) {
+        const index =
+            combined.indexOf(
+                `"${id}"`
+            );
+
+        if (index < 0) {
+            continue;
+        }
+
+        const start =
+            Math.max(
+                0,
+                index - 4000
+            );
+
+        const end =
+            Math.min(
+                combined.length,
+                index + 12000
+            );
+
+        const chunk =
+            combined.slice(
+                start,
+                end
+            );
+
+        const item =
+            parseListingChunk(
+                chunk,
+                id
+            );
+
+        if (item) {
+            objects.push(item);
+        }
+    }
+
+    return objects;
 }
+
+
+/* =========================================================
+   استخراج بطاقات HTML كخطة احتياطية
+========================================================= */
 
 function parseDomCards(html) {
     const results = [];
@@ -868,41 +893,34 @@ function parseDomCards(html) {
     let match;
 
     while (
-        (match =
-            regex.exec(html))
+        (match = regex.exec(html))
     ) {
         const url =
-            decodeHtml(
-                match[1]
-            );
+            decodeHtml(match[1]);
 
         const id =
             match[2];
 
-        if (
-            ids.has(id)
-        ) {
+        if (ids.has(id)) {
             continue;
         }
 
         ids.add(id);
 
         const text =
-            stripTags(
-                match[3]
-            );
+            stripTags(match[3]);
 
-        if (!text) continue;
+        if (!text) {
+            continue;
+        }
 
-        if (
-            /^مميز/.test(text)
-        ) {
+        if (/^مميز/.test(text)) {
             continue;
         }
 
         const price =
             text.match(
-                /([\d,]+(?:\.\d+)?)\s*(?:ر\.س|ريال|﷼|§)/
+                /([\d,]+(?:\.\d+)?)\s*(?:ر\.س|ريال|﷼)/
             )?.[1] || '';
 
         const area =
@@ -952,22 +970,16 @@ function mergeListings(
 ) {
     const map = new Map();
 
-    for (
-        const item of fallback
-    ) {
+    for (const item of fallback) {
         map.set(
             item._raw_id,
             item
         );
     }
 
-    for (
-        const item of primary
-    ) {
+    for (const item of primary) {
         const old =
-            map.get(
-                item._raw_id
-            );
+            map.get(item._raw_id);
 
         map.set(
             item._raw_id,
@@ -985,20 +997,21 @@ function mergeListings(
     return [...map.values()];
 }
 
+
+/* =========================================================
+   HTTP
+========================================================= */
+
 async function fetchText(
     url,
     timeout = 30000
 ) {
-    const proxy =
-        await proxyConfiguration.newUrl();
-
     const controller =
         new AbortController();
 
     const timer =
         setTimeout(
-            () =>
-                controller.abort(),
+            () => controller.abort(),
             timeout
         );
 
@@ -1010,23 +1023,19 @@ async function fetchText(
                     headers: {
                         'User-Agent':
                             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36',
+
                         'Accept':
                             'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+
                         'Accept-Language':
                             'ar-SA,ar;q=0.9,en;q=0.8',
+
                         'Cache-Control':
                             'no-cache'
                     },
 
                     signal:
-                        controller.signal,
-
-                    ...(proxy
-                        ? {
-                            dispatcher:
-                                undefined
-                        }
-                        : {})
+                        controller.signal
                 }
             );
 
@@ -1043,9 +1052,12 @@ async function fetchText(
     }
 }
 
-function parseDetailHtml(
-    html
-) {
+
+/* =========================================================
+   تفاصيل الإعلان - HTTP
+========================================================= */
+
+function parseDetailHtml(html) {
     const text =
         stripTags(html);
 
@@ -1064,23 +1076,21 @@ function parseDetailHtml(
     let verified = false;
 
     const datePatterns = [
-        /تاريخ الإضافة\s*[:：-]?\s*([^\n]{1,50})/i,
-        /تاريخ الإعلان\s*[:：-]?\s*([^\n]{1,50})/i,
-        /أضيف\s*[:：-]?\s*([^\n]{1,50})/i
+        /تاريخ الإضافة\s*[:：-]?\s*([^\n]{1,80})/i,
+        /تاريخ الإعلان\s*[:：-]?\s*([^\n]{1,80})/i,
+        /أضيف\s*[:：-]?\s*([^\n]{1,80})/i
     ];
 
-    for (
-        const pattern of datePatterns
-    ) {
+    for (const pattern of datePatterns) {
         const match =
             text.match(pattern);
 
-        if (!match) continue;
+        if (!match) {
+            continue;
+        }
 
         const date =
-            parseDate(
-                match[1]
-            );
+            parseDate(match[1]);
 
         if (date) {
             postedRaw =
@@ -1101,9 +1111,7 @@ function parseDetailHtml(
 
         if (iso) {
             const date =
-                parseDate(
-                    iso[1]
-                );
+                parseDate(iso[1]);
 
             if (date) {
                 postedRaw =
@@ -1115,19 +1123,15 @@ function parseDetailHtml(
         }
     }
 
-    if (!bedrooms) {
-        bedrooms =
-            text.match(
-                /(\d+)\s*(?:غرف|غرفة)/
-            )?.[1] || '';
-    }
+    bedrooms =
+        text.match(
+            /(\d+)\s*(?:غرف|غرفة)/
+        )?.[1] || '';
 
-    if (!bathrooms) {
-        bathrooms =
-            text.match(
-                /(\d+)\s*(?:حمامات|حمام)/
-            )?.[1] || '';
-    }
+    bathrooms =
+        text.match(
+            /(\d+)\s*(?:حمامات|حمام)/
+        )?.[1] || '';
 
     const licenseMatch =
         text.match(
@@ -1146,8 +1150,7 @@ function parseDetailHtml(
 
     if (ownerMatch) {
         ownerName =
-            ownerMatch[1]
-                .trim();
+            ownerMatch[1].trim();
     }
 
     verified =
@@ -1166,10 +1169,259 @@ function parseDetailHtml(
     };
 }
 
-async function fetchDetail(
+
+/* =========================================================
+   Playwright للهاتف فقط
+========================================================= */
+
+async function getBrowser() {
+    if (browser) {
+        return browser;
+    }
+
+    log.info(
+        '🌐 تشغيل متصفح الهاتف...'
+    );
+
+    browser =
+        await chromium.launch({
+            headless: true,
+
+            args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-gpu',
+                '--disable-extensions',
+                '--disable-background-networking'
+            ]
+        });
+
+    return browser;
+}
+
+async function phoneFromPage(page) {
+
+    // 1) tel links
+    let phone =
+        await page.evaluate(() => {
+            const links =
+                [...document.querySelectorAll(
+                    'a[href^="tel:"], a[href*="tel:"], a[href*="phone"]'
+                )];
+
+            for (const link of links) {
+                const href =
+                    link.getAttribute('href') || '';
+
+                const text =
+                    link.textContent || '';
+
+                const value =
+                    `${href} ${text}`;
+
+                const match =
+                    value.match(
+                        /(?:\+966|00966|966|0)?[\s\-().]*5[\s\-().]*\d{8}/
+                    );
+
+                if (match) {
+                    return match[0];
+                }
+            }
+
+            return '';
+        });
+
+    phone =
+        extractPhone(phone);
+
+    if (phone) {
+        return phone;
+    }
+
+    // 2) البحث في HTML نفسه
+    const html =
+        await page.content();
+
+    phone =
+        extractPhone(html);
+
+    if (phone) {
+        return phone;
+    }
+
+    // 3) محاولة الضغط على اتصال
+    const selectors = [
+        'text=اتصال',
+        'text=اتصل',
+        'button:has-text("اتصال")',
+        'a:has-text("اتصال")'
+    ];
+
+    for (const selector of selectors) {
+        try {
+            const locator =
+                page.locator(selector);
+
+            const count =
+                await locator.count();
+
+            if (!count) {
+                continue;
+            }
+
+            await locator
+                .first()
+                .click({
+                    timeout: 4000
+                })
+                .catch(() => {});
+
+            await page.waitForTimeout(1000);
+
+            break;
+
+        } catch {
+            // نجرب selector التالي
+        }
+    }
+
+    // 4) بعد الضغط: tel
+    phone =
+        await page.evaluate(() => {
+            const links =
+                [...document.querySelectorAll(
+                    'a[href^="tel:"], a[href*="tel:"], a[href*="phone"]'
+                )];
+
+            return links
+                .map(link =>
+                    `${link.getAttribute('href') || ''} ${link.textContent || ''}`
+                )
+                .join(' ');
+        });
+
+    phone =
+        extractPhone(phone);
+
+    if (phone) {
+        return phone;
+    }
+
+    // 5) بعد الضغط: body
+    const bodyText =
+        await page.locator('body')
+            .innerText()
+            .catch(() => '');
+
+    phone =
+        extractPhone(bodyText);
+
+    return phone || '';
+}
+
+async function fetchPhoneWithBrowser(
     listing
 ) {
-    if (!listing.url) {
+    if (!listing?.url) {
+        return '';
+    }
+
+    let page = null;
+
+    try {
+        const browser =
+            await getBrowser();
+
+        page =
+            await browser.newPage({
+                viewport: {
+                    width: 1280,
+                    height: 900
+                },
+
+                locale: 'ar-SA',
+
+                userAgent:
+                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36'
+            });
+
+        // نمنع الصور والخطوط والإعلانات
+        // لتقليل الوقت واستهلاك CPU
+        await page.route(
+            '**/*',
+            async route => {
+                const type =
+                    route.request().resourceType();
+
+                if (
+                    [
+                        'image',
+                        'font',
+                        'media'
+                    ].includes(type)
+                ) {
+                    await route.abort()
+                        .catch(() => {});
+                } else {
+                    await route.continue()
+                        .catch(() => {});
+                }
+            }
+        );
+
+        await page.goto(
+            listing.url,
+            {
+                waitUntil:
+                    'domcontentloaded',
+
+                timeout: 20000
+            }
+        );
+
+        await page.waitForTimeout(700);
+
+        const phone =
+            await phoneFromPage(page);
+
+        if (phone) {
+            log.info(
+                `📱 الهاتف ${listing._raw_id}: ${phone}`
+            );
+
+            return phone;
+        }
+
+        log.warning(
+            `⚠️ لم يظهر الهاتف: ${listing._raw_id}`
+        );
+
+        return '';
+
+    } catch (error) {
+        log.warning(
+            `⚠️ فشل استخراج الهاتف ${listing._raw_id}: ${error.message}`
+        );
+
+        return '';
+
+    } finally {
+        if (page) {
+            await page.close()
+                .catch(() => {});
+        }
+    }
+}
+
+
+/* =========================================================
+   تفاصيل كاملة
+========================================================= */
+
+async function fetchDetail(listing) {
+    if (!listing?.url) {
         return null;
     }
 
@@ -1177,30 +1429,77 @@ async function fetchDetail(
         const html =
             await fetchText(
                 listing.url,
-                25000
+                20000
             );
 
-        return parseDetailHtml(
-            html
-        );
+        const detail =
+            parseDetailHtml(html);
+
+        /*
+         * إذا لم نجد الهاتف في HTTP
+         * نستخدم Playwright فقط هنا.
+         */
+        if (
+            FETCH_PHONE &&
+            !detail.phone
+        ) {
+            detail.phone =
+                await fetchPhoneWithBrowser(
+                    listing
+                );
+        }
+
+        return detail;
 
     } catch (error) {
         log.warning(
-            `⚠️ detail ${listing._raw_id}: ${error.message}`
+            `⚠️ HTTP detail ${listing._raw_id}: ${error.message}`
         );
+
+        /*
+         * حتى إذا فشل HTTP،
+         * نحاول الهاتف مباشرة.
+         */
+        if (FETCH_PHONE) {
+            const phone =
+                await fetchPhoneWithBrowser(
+                    listing
+                );
+
+            if (phone) {
+                return {
+                    phone,
+
+                    postedDate: null,
+                    postedRaw: '',
+
+                    bedrooms: '',
+                    bathrooms: '',
+
+                    ownerName: '',
+                    license: '',
+
+                    verified: false
+                };
+            }
+        }
 
         return null;
     }
 }
+
+
+/* =========================================================
+   التوازي
+========================================================= */
 
 async function mapConcurrent(
     items,
     limit,
     worker
 ) {
-    const output = new Array(
-        items.length
-    );
+    const output =
+        new Array(items.length);
 
     let index = 0;
 
@@ -1216,11 +1515,20 @@ async function mapConcurrent(
                 return;
             }
 
-            output[current] =
-                await worker(
-                    items[current],
-                    current
+            try {
+                output[current] =
+                    await worker(
+                        items[current],
+                        current
+                    );
+            } catch (error) {
+                log.warning(
+                    `⚠️ Worker error: ${error.message}`
                 );
+
+                output[current] =
+                    null;
+            }
         }
     }
 
@@ -1233,8 +1541,7 @@ async function mapConcurrent(
                         items.length
                     )
             },
-            () =>
-                runner()
+            () => runner()
         );
 
     await Promise.all(
@@ -1244,16 +1551,19 @@ async function mapConcurrent(
     return output;
 }
 
+
+/* =========================================================
+   صفحة البحث
+========================================================= */
+
 async function processPage(
     pageNumber
 ) {
     const url =
-        getPageUrl(
-            pageNumber
-        );
+        getPageUrl(pageNumber);
 
     log.info(
-        `📄 صفحة ${pageNumber}: ${url}`
+        `📄 فتح صفحة ${pageNumber}: ${url}`
     );
 
     const html =
@@ -1263,14 +1573,10 @@ async function processPage(
         );
 
     let listings =
-        findListingObjects(
-            html
-        );
+        findListingObjects(html);
 
     const dom =
-        parseDomCards(
-            html
-        );
+        parseDomCards(html);
 
     listings =
         mergeListings(
@@ -1284,6 +1590,11 @@ async function processPage(
 
     return listings;
 }
+
+
+/* =========================================================
+   جمع الصفحات
+========================================================= */
 
 const allListings = [];
 
@@ -1301,9 +1612,7 @@ for (
 
     try {
         const listings =
-            await processPage(
-                page
-            );
+            await processPage(page);
 
         pagesScanned++;
 
@@ -1317,9 +1626,7 @@ for (
             break;
         }
 
-        for (
-            const listing of listings
-        ) {
+        for (const listing of listings) {
             if (
                 !listing._raw_id ||
                 seen.has(
@@ -1342,8 +1649,6 @@ for (
         log.warning(
             `⚠️ فشل الصفحة ${page}: ${error.message}`
         );
-
-        continue;
     }
 }
 
@@ -1351,173 +1656,153 @@ log.info(
     `📦 إجمالي الإعلانات الخام: ${allListings.length}`
 );
 
-if (
-    allListings.length === 0
-) {
-    log.warning(
-        '⚠️ لم يتم العثور على إعلانات.'
-    );
-} else {
+
+/* =========================================================
+   معالجة التفاصيل
+========================================================= */
+
+if (allListings.length > 0) {
+
     /*
-     * أولاً نحاول الاستفادة من التاريخ
-     * الموجود في بيانات صفحة البحث.
+     * نحاول أولاً استخدام التاريخ الموجود
+     * في صفحة البحث.
      */
-    for (
-        const listing of allListings
-    ) {
-        if (
-            listing.postedDate
-        ) {
+    for (const listing of allListings) {
+        if (listing.postedDate) {
             dateFound++;
         }
     }
 
     /*
      * في وضع اليوم فقط:
-     * نفحص تفاصيل الإعلانات التي
-     * لا نملك تاريخها.
+     * الإعلان الذي نعرف أنه قديم نستبعده.
      *
-     * إذا كان لدينا تاريخ اليوم بالفعل
-     * لا نحتاج إلى فتح التفاصيل.
+     * أما الإعلان الذي لا نعرف تاريخه،
+     * فيدخل مرحلة التفاصيل.
      */
-    let candidates =
+    const needDetails =
         allListings.filter(
-            item => {
+            listing => {
+
                 if (
                     TODAY_ONLY &&
-                    item.postedDate
+                    listing.postedDate &&
+                    !isToday(
+                        listing.postedDate
+                    )
                 ) {
-                    return isToday(
-                        item.postedDate
-                    );
+                    return false;
                 }
 
                 return true;
             }
         );
 
-    /*
-     * إذا لم يوجد تاريخ في القائمة،
-     * نفحص التفاصيل بالتوازي.
-     */
-    if (
-        FETCH_PHONE ||
-        TODAY_ONLY ||
-        candidates.length <
-            MAX_RESULTS
-    ) {
-        const needDetails =
-            allListings.filter(
-                item => {
-                    if (
-                        TODAY_ONLY &&
-                        item.postedDate &&
-                        !isToday(
-                            item.postedDate
+    log.info(
+        `⚡ سيتم فحص ${needDetails.length} إعلان بالتفاصيل`
+    );
+
+    const details =
+        await mapConcurrent(
+            needDetails,
+            CONCURRENCY,
+            async listing => {
+
+                detailsChecked++;
+
+                return {
+                    listing,
+
+                    detail:
+                        await fetchDetail(
+                            listing
                         )
-                    ) {
-                        return false;
-                    }
-
-                    return true;
-                }
-            );
-
-        log.info(
-            `⚡ فحص ${needDetails.length} تفاصيل بتوازي ${CONCURRENCY}`
+                };
+            }
         );
 
-        const details =
-            await mapConcurrent(
-                needDetails,
-                CONCURRENCY,
-                async listing => {
-                    detailsChecked++;
+    for (const row of details) {
 
-                    return {
-                        listing,
-                        detail:
-                            await fetchDetail(
-                                listing
-                            )
-                    };
-                }
-            );
-
-        for (
-            const row of details
-        ) {
-            if (
-                !row.detail
-            ) {
-                continue;
-            }
-
-            const {
-                listing,
-                detail
-            } = row;
-
-            if (
-                detail.postedDate
-            ) {
-                dateFound++;
-
-                listing.postedDate =
-                    detail.postedDate;
-
-                listing.postedRaw =
-                    detail.postedRaw;
-            } else {
-                dateMissing++;
-            }
-
-            if (
-                detail.phone
-            ) {
-                listing.phone =
-                    detail.phone;
-            }
-
-            if (
-                detail.bedrooms
-            ) {
-                listing.bedrooms =
-                    detail.bedrooms;
-            }
-
-            if (
-                detail.bathrooms
-            ) {
-                listing.bathrooms =
-                    detail.bathrooms;
-            }
-
-            if (
-                detail.ownerName
-            ) {
-                listing.owner_name =
-                    detail.ownerName;
-            }
-
-            if (
-                detail.license
-            ) {
-                listing.rega_license =
-                    detail.license;
-            }
-
-            listing.is_verified =
-                detail.verified;
+        if (!row) {
+            continue;
         }
 
-        candidates =
-            allListings;
+        const {
+            listing,
+            detail
+        } = row;
+
+        if (!detail) {
+            continue;
+        }
+
+        /*
+         * التاريخ
+         */
+        if (
+            detail.postedDate
+        ) {
+            dateFound++;
+
+            listing.postedDate =
+                detail.postedDate;
+
+            listing.postedRaw =
+                detail.postedRaw;
+        } else {
+            dateMissing++;
+        }
+
+        /*
+         * الهاتف
+         */
+        if (detail.phone) {
+            listing.phone =
+                detail.phone;
+
+            phonesFound++;
+        } else {
+            phonesMissing++;
+        }
+
+        /*
+         * باقي البيانات
+         */
+        if (detail.bedrooms) {
+            listing.bedrooms =
+                detail.bedrooms;
+        }
+
+        if (detail.bathrooms) {
+            listing.bathrooms =
+                detail.bathrooms;
+        }
+
+        if (detail.ownerName) {
+            listing.owner_name =
+                detail.ownerName;
+        }
+
+        if (detail.license) {
+            listing.rega_license =
+                detail.license;
+        }
+
+        listing.is_verified =
+            Boolean(
+                detail.verified
+            );
     }
 
+
+    /* =====================================================
+       إخراج النتائج
+    ===================================================== */
+
     for (
-        const listing of candidates
+        const listing of allListings
     ) {
+
         if (
             results.length >=
             MAX_RESULTS
@@ -1525,9 +1810,11 @@ if (
             break;
         }
 
-        if (
-            TODAY_ONLY
-        ) {
+        /*
+         * اليوم فقط
+         */
+        if (TODAY_ONLY) {
+
             if (
                 !listing.postedDate
             ) {
@@ -1544,6 +1831,7 @@ if (
         }
 
         const item = {
+
             _raw_id:
                 listing._raw_id,
 
@@ -1577,6 +1865,9 @@ if (
                 listing.description ||
                 '',
 
+            /*
+             * الهاتف
+             */
             phone:
                 listing.phone ||
                 '',
@@ -1639,34 +1930,35 @@ if (
                     .toISOString()
         };
 
-        results.push(
-            item
-        );
+        results.push(item);
 
-        await Actor.pushData(
-            item
-        );
+        await Actor.pushData(item);
 
         log.info(
-            `✅ ${results.length}/${MAX_RESULTS} | ${item.name.slice(0, 45)} | ${item.posted_at}`
+            `✅ ${results.length}/${MAX_RESULTS} | ${item.name.slice(0, 45)} | 📱 ${item.phone || 'بدون هاتف'}`
         );
     }
 }
+
+
+/* =========================================================
+   الإحصائيات
+========================================================= */
 
 log.info(
     '━━━━━━━━━━━━━━━━━━━━━━'
 );
 
 log.info(
-    `🎯 النتائج: ${results.length}`
+    `🎯 النتائج النهائية: ${results.length}`
 );
 
 log.info(
-    `📄 الصفحات: ${pagesScanned}`
+    `📄 الصفحات المفحوصة: ${pagesScanned}`
 );
 
 log.info(
-    `🔎 التفاصيل: ${detailsChecked}`
+    `🔎 التفاصيل المفحوصة: ${detailsChecked}`
 );
 
 log.info(
@@ -1677,6 +1969,14 @@ log.info(
     `⚠️ بدون تاريخ: ${dateMissing}`
 );
 
+log.info(
+    `📱 أرقام تم العثور عليها: ${phonesFound}`
+);
+
+log.info(
+    `📵 أرقام لم يتم العثور عليها: ${phonesMissing}`
+);
+
 if (
     results.length === 0 &&
     TODAY_ONLY
@@ -1684,17 +1984,33 @@ if (
     log.warning(
         `⚠️ لم يتم تأكيد أي إعلان بتاريخ ${TODAY}.`
     );
+}
+
+if (
+    FETCH_PHONE &&
+    phonesFound === 0 &&
+    results.length > 0
+) {
+    log.warning(
+        '⚠️ ظهرت النتائج لكن لم يتم العثور على أي رقم هاتف.'
+    );
 
     log.warning(
-        'هذا يعني أن النظام لم يجد إعلاناً استطاع تأكيد أنه من اليوم، وليس مجرد تخمين.'
+        'قد يكون الهاتف محمياً أو يحتاج آلية مختلفة من موقع عقار.'
     );
 }
+
+
+/* =========================================================
+   Webhook
+========================================================= */
 
 if (
     webhookUrl &&
     webhookUrl.trim()
 ) {
     try {
+
         const datasetId =
             process.env
                 .APIFY_DEFAULT_DATASET_ID;
@@ -1711,6 +2027,7 @@ if (
 
                 body:
                     JSON.stringify({
+
                         status:
                             'success',
 
@@ -1721,6 +2038,7 @@ if (
                             TODAY_ONLY,
 
                         search,
+
                         city,
 
                         pagesScanned,
@@ -1729,6 +2047,10 @@ if (
 
                         resultsCount:
                             results.length,
+
+                        phonesFound,
+
+                        phonesMissing,
 
                         datasetId,
 
@@ -1743,10 +2065,21 @@ if (
         );
 
     } catch (error) {
+
         log.warning(
             `⚠️ Webhook: ${error.message}`
         );
     }
+}
+
+
+/* =========================================================
+   إغلاق المتصفح
+========================================================= */
+
+if (browser) {
+    await browser.close()
+        .catch(() => {});
 }
 
 await Actor.exit();
